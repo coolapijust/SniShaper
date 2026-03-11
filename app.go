@@ -151,6 +151,19 @@ func (a *App) startup(ctx context.Context) {
 	}
 
 	runtime.LogInfo(ctx, "[startup] SniShaper started successfully")
+
+	// Auto-start proxy for easier diagnostics and better UX
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		_ = a.StartProxy()
+
+		// If auto update is enabled, fetch IPs immediately
+		cfg := a.ruleManager.GetCloudflareConfig()
+		if cfg.AutoUpdate {
+			a.appendLog("[Cloudflare] Auto update is enabled, fetching initial IPs...")
+			go a.RefreshCloudflareIPPool()
+		}
+	}()
 }
 
 func (a *App) shutdown(ctx context.Context) {
@@ -179,19 +192,9 @@ func (a *App) setupFileLogger() {
 	if a.logBuffer == nil {
 		a.logBuffer = newRingLogWriter(5000)
 	}
-
-	f, err := os.OpenFile(a.logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
-		log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-		log.SetOutput(io.MultiWriter(os.Stdout, a.logBuffer))
-		log.Printf("[startup] Failed to open log file %s: %v", a.logPath, err)
-		return
-	}
-	a.logFile = f
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	log.SetOutput(io.MultiWriter(os.Stdout, f, a.logBuffer))
-	log.Printf("[startup] Logging to %s", a.logPath)
-	a.appendLog("[startup] file logger configured")
+	log.SetOutput(io.MultiWriter(os.Stdout, a.logBuffer))
+	a.appendLog("[startup] logger configured (in-memory only)")
 }
 
 func (a *App) appendLog(message string) {
@@ -238,13 +241,6 @@ func (a *App) ClearLogs() error {
 	if a.logBuffer != nil {
 		a.logBuffer.Clear()
 	}
-	if a.logFile != nil {
-		_ = a.logFile.Close()
-		a.logFile = nil
-	}
-	if err := os.WriteFile(a.logPath, []byte{}, 0644); err != nil {
-		return err
-	}
 	a.setupFileLogger()
 	return nil
 }
@@ -258,8 +254,12 @@ func (a *App) StartProxy() error {
 	a.appendLog("[action] StartProxy called")
 	err := a.proxyServer.Start()
 	if err != nil {
-		a.appendLog("[error] StartProxy failed: " + err.Error())
-		return err
+		msg := err.Error()
+		if strings.Contains(msg, "Only one usage of each socket address") || strings.Contains(msg, "bind: address already in use") {
+			msg += " (端口被占用，请检查是否有旧版程序未关闭)"
+		}
+		a.appendLog("[error] StartProxy failed: " + msg)
+		return fmt.Errorf(msg)
 	}
 	addr := a.proxyServer.GetListenAddr()
 	if err := a.waitForProxyListen(addr, 2*time.Second); err != nil {
@@ -420,12 +420,91 @@ func (a *App) GetCloudflareConfig() proxy.CloudflareConfig {
 	return a.ruleManager.GetCloudflareConfig()
 }
 
+func (a *App) GetServerConfig() map[string]string {
+	res := map[string]string{
+		"host": "",
+		"auth": "",
+	}
+	if a.ruleManager != nil {
+		res["host"] = a.ruleManager.GetServerHost()
+		res["auth"] = a.ruleManager.GetServerAuth()
+	}
+	return res
+}
+
+func (a *App) UpdateServerConfig(host, auth string) error {
+	if a.ruleManager != nil {
+		err := a.ruleManager.UpdateServerConfig(strings.TrimSpace(host), strings.TrimSpace(auth))
+		if err == nil {
+			a.appendLog(fmt.Sprintf("[INFO] Updated Server Worker settings, Host: %s", host))
+		} else {
+			a.appendLog(fmt.Sprintf("[ERROR] Failed to save Server settings: %v", err))
+		}
+		return err
+	}
+	return fmt.Errorf("RuleManager not initialized")
+}
+
 func (a *App) UpdateCloudflareConfig(cfg proxy.CloudflareConfig) error {
+	// Get old config to check if AutoUpdate was toggled
+	oldCfg := a.ruleManager.GetCloudflareConfig()
+
 	err := a.ruleManager.UpdateCloudflareConfig(cfg)
 	if err == nil {
 		a.proxyServer.UpdateCloudflareConfig(cfg)
+		// If toggled from false to true, trigger an update
+		if cfg.AutoUpdate && !oldCfg.AutoUpdate {
+			a.appendLog("[Cloudflare] Auto update enabled, triggering fetch...")
+			go a.RefreshCloudflareIPPool()
+		}
 	}
 	return err
+}
+
+func (a *App) RefreshCloudflareIPPool() {
+	cfg := a.ruleManager.GetCloudflareConfig()
+	ips, err := proxy.FetchCloudflareIPs(cfg.APIKey)
+	if err != nil {
+		log.Printf("[Cloudflare] Failed to fetch preferred IPs: %v", err)
+		a.appendLog("[error] Cloudflare 优选 IP 获取失败: " + err.Error())
+		return
+	}
+
+	if len(ips) > 0 {
+		log.Printf("[Cloudflare] Successfully fetched %d preferred IPs", len(ips))
+		a.appendLog(fmt.Sprintf("[success] 成功获取 %d 个 Cloudflare 优选 IP", len(ips)))
+
+		a.proxyServer.UpdateCloudflareIPPool(ips)
+		// 持久化：同步到配置文件
+		cfg.PreferredIPs = ips
+		_ = a.ruleManager.UpdateCloudflareConfig(cfg)
+	}
+}
+
+func (a *App) ForceFetchCloudflareIPs() error {
+	cfg := a.ruleManager.GetCloudflareConfig()
+	ips, err := proxy.FetchCloudflareIPs(cfg.APIKey)
+	if err != nil {
+		log.Printf("[Cloudflare] Failed to fetch preferred IPs: %v", err)
+		a.appendLog("[error] 手动获取失败: " + err.Error())
+		return err
+	}
+
+	if len(ips) > 0 {
+		log.Printf("[Cloudflare] Successfully fetched %d preferred IPs", len(ips))
+		a.appendLog(fmt.Sprintf("[success] 成功获取 %d 个 Cloudflare 优选 IP", len(ips)))
+		a.proxyServer.UpdateCloudflareIPPool(ips)
+		// 持久化：同步到配置文件
+		cfg.PreferredIPs = ips
+		_ = a.ruleManager.UpdateCloudflareConfig(cfg)
+		// Trigger immediate health check to update stats
+		a.proxyServer.TriggerCFHealthCheck()
+	}
+	return nil
+}
+
+func (a *App) GetCloudflareIPStats() []*proxy.IPStats {
+	return a.proxyServer.GetAllCFIPsWithStats()
 }
 
 func (a *App) ExportConfig() (string, error) {
@@ -451,6 +530,17 @@ type ProxyDiagnostics struct {
 	Requests      int64
 	Connects      int64
 	RecentIngress []string
+}
+
+func (a *App) TriggerCFHealthCheck() {
+	a.proxyServer.TriggerCFHealthCheck()
+	a.appendLog("[Cloudflare] 手动触发 IP 健康检查...")
+}
+
+func (a *App) RemoveInvalidCFIPs() int {
+	count := a.proxyServer.RemoveInvalidCFIPs()
+	a.appendLog(fmt.Sprintf("[Cloudflare] 已清理 %d 个失效 IP", count))
+	return count
 }
 
 func (a *App) GetSystemProxyStatus() SystemProxyStatus {
@@ -515,18 +605,11 @@ func (a *App) waitForProxyListen(addr string, timeout time.Duration) error {
 	return lastErr
 }
 
-func (a *App) GetProxyDiagnostics() ProxyDiagnostics {
-	accepted, requests, connects, recent := a.proxyServer.GetDiagnostics()
-	return ProxyDiagnostics{
-		Accepted:      accepted,
-		Requests:      requests,
-		Connects:      connects,
-		RecentIngress: recent,
+func (a *App) GetProxyDiagnostics() map[string]interface{} {
+	return map[string]interface{}{
+		"ListenAddr": a.proxyServer.GetListenAddr(),
+		"Status":     "OK",
 	}
-}
-
-func (a *App) GetRuleHitCounts() map[string]int64 {
-	return a.ruleManager.GetRuleHitCounts()
 }
 
 func (a *App) ProxySelfCheck() string {

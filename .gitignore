@@ -16,7 +16,14 @@ frontend/dist/
 frontend/wailsjs/
 
 # Runtime generated data
-cert/
+# Go code - keep these files
+!cert/cert.go
+!cert/exec_windows.go
+
+# Runtime generated certificates
+cert/*.crt
+cert/*.key
+cert/*.pem
 *.log
 config.json
 diag_report_*.txt
@@ -36,3 +43,7 @@ rules/*.v2.json
 Thumbs.db
 .vscode/
 .idea/
+
+# Custom ignores
+doc/
+shaper-next/

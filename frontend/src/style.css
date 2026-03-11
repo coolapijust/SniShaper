@@ -1241,4 +1241,97 @@ html[data-theme="dark"] .theme-toggle::before {
 
 .quick-link:hover {
     text-decoration: underline;
+}.ip-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    gap: 12px;
+    margin-top: 12px;
+}
+
+.ip-card {
+    background: var(--bg-hover);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    position: relative;
+    transition: all 0.2s;
+}
+
+.ip-card:hover {
+    border-color: var(--accent);
+    background: var(--bg-card);
+    transform: translateY(-1px);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05);
+}
+
+.ip-address {
+    font-family: "SF Mono", "Fira Code", Consolas, monospace;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-primary);
+    letter-spacing: -0.5px;
+}
+
+.ip-meta {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 11px;
+    height: 16px;
+}
+
+.ip-latency {
+    font-weight: 600;
+}
+
+.ip-latency.good {
+    color: var(--success);
+}
+
+.ip-latency.fair {
+    color: var(--warning);
+}
+
+.ip-latency.poor {
+    color: var(--danger);
+}
+
+.ip-latency.checking {
+    color: var(--text-secondary);
+    font-style: italic;
+}
+
+.ip-remove {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    width: 20px;
+    height: 20px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 4px;
+    cursor: pointer;
+    color: var(--text-muted);
+    opacity: 0;
+    transition: all 0.2s;
+}
+
+.ip-card:hover .ip-remove {
+    opacity: 1;
+}
+
+.ip-remove:hover {
+    background: var(--danger);
+    color: white;
+}
+
+/* Loading states for buttons */
+.btn.loading {
+    opacity: 0.7;
+    cursor: wait;
+    pointer-events: none;
 }

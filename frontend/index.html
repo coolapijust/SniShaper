@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SniShaper - DPI 代理工具</title>
+    <title>SniShaper - 为加速而生</title>
     <link rel="stylesheet" href="/src/style.css">
     <link rel="icon" href="/src/assets/logo.png">
 </head>
@@ -42,6 +42,10 @@
                     <span class="nav-icon"></span>
                     <span>Cloudflare ECH</span>
                 </a>
+                <a href="#" class="nav-item" data-page="server">
+                    <span class="nav-icon"></span>
+                    <span>Server 节点</span>
+                </a>
                 <a href="#" class="nav-item" data-page="settings">
                     <span class="nav-icon"></span>
                     <span>设置</span>
@@ -58,7 +62,7 @@
             <!-- Dashboard Page -->
             <div id="page-dashboard" class="page">
                 <h1>仪表盘</h1>
-                <p class="page-subtitle">实时监控代理状态与流量</p>
+                <p class="page-subtitle">实时监控代理状态与连接信息</p>
 
                 <div class="status-cards">
                     <div class="card">
@@ -101,23 +105,17 @@
                 </div>
 
                 <div class="card">
-                    <div class="card-title">流量统计</div>
-                    <div class="stats-grid">
-                        <div class="stat-item">
-                            <div class="stat-label">↓ 下行</div>
-                            <div class="stat-value" id="stat-downlink">0 B</div>
-                        </div>
-                        <div class="stat-item">
-                            <div class="stat-label">↑ 上行</div>
-                            <div class="stat-value" id="stat-uplink">0 B</div>
-                        </div>
-                        <div class="stat-item">
-                            <div class="stat-label">连接数</div>
-                            <div class="stat-value" id="stat-connections">0</div>
-                        </div>
-                        <div class="stat-item">
-                            <div class="stat-label">运行时间</div>
-                            <div class="stat-value" id="stat-uptime">00:00:00</div>
+                    <div class="card-title">连接信息</div>
+                    <div class="stats-grid" style="grid-template-columns: 1fr;">
+                        <div class="stat-item" style="border: none; padding: 0;">
+                            <div class="stat-label">本地 HTTP 代理地址</div>
+                            <div class="stat-value" id="proxy-addr-display"
+                                style="font-size: 24px; color: var(--accent); cursor: pointer;" title="点击复制">
+                                127.0.0.1:8080
+                            </div>
+                            <small style="color: var(--text-secondary); margin-top: 8px; display: block;">
+                                协议: HTTP | 支持 CONNECT 隧道
+                            </small>
                         </div>
                     </div>
                 </div>
@@ -135,6 +133,7 @@
                 </div>
                 <div class="rules-toolbar">
                     <div class="rules-mode-switch">
+                        <button id="rules-mode-server" class="btn btn-secondary" type="button">Server</button>
                         <button id="rules-mode-mitm" class="btn btn-secondary active" type="button">MITM</button>
                         <button id="rules-mode-transparent" class="btn btn-secondary" type="button">透传</button>
                     </div>
@@ -213,6 +212,42 @@ exhentai.org" rows="3"></textarea>
                 </div>
             </div>
 
+            <!-- Server Page -->
+            <div id="page-server" class="page" style="display: none;">
+                <div class="page-header">
+                    <h1>Server 专属节点设置</h1>
+                    <div style="display:flex; gap:8px;">
+                        <button class="btn btn-primary" onclick="saveServerConfig()" id="btn-save-server">保存配置</button>
+                    </div>
+                </div>
+
+                <p class="page-subtitle">配置部署在海外的 Cloudflare Workers 或独立 VPS 节点，绕过流媒体区域封锁。</p>
+
+                <div class="settings-section">
+                    <h3>节点连接参数</h3>
+                    <div class="setting-item" style="flex-direction: column; align-items: flex-start; gap: 8px;">
+                        <label>中转域名 (Server Host)</label>
+                        <input type="text" id="setting-server-host" placeholder="例如: proxy.yourdomain.workers.dev"
+                            style="width: 100%;">
+                    </div>
+                    <div class="setting-item" style="flex-direction: column; align-items: flex-start; gap: 8px;">
+                        <label>鉴权密钥 (AUTH_SECRET)</label>
+                        <input type="password" id="setting-server-auth" placeholder="输入服务端配置的加密令牌" style="width: 100%;">
+                    </div>
+                </div>
+
+                <div class="settings-section">
+                    <h3>一键加速 (批量录入)</h3>
+                    <div class="cert-info">在此录入域名后，系统将自动批量生成 <strong>Server 节点模式</strong> 的规则。默认启用 ECH 与优选池。</div>
+                    <div class="form-group" style="margin-bottom: 16px;">
+                        <textarea id="server-input-domains"
+                            placeholder="一行一个域名，如：&#10;googlevideo.com&#10;*.googlevideo.com" rows="5"
+                            style="width: 100%; padding: 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-dark); color: var(--text-primary); font-family: monospace;"></textarea>
+                    </div>
+                    <button class="btn btn-secondary" onclick="addServerRule()">🚀 批量添加加速规则</button>
+                </div>
+            </div>
+
             <!-- Settings Page -->
             <div id="page-settings" class="page" style="display: none;">
                 <h1>设置</h1>
@@ -242,6 +277,14 @@ exhentai.org" rows="3"></textarea>
                 <div class="settings-section">
                     <h3>Cloudflare 专项优化</h3>
                     <div class="setting-item">
+                        <label>自动获取优选 IP</label>
+                        <input type="checkbox" id="setting-cf-auto-update">
+                    </div>
+                    <div class="setting-item">
+                        <label>API 密钥 (wetest.vip)</label>
+                        <input type="text" id="setting-cf-api-key" placeholder="默认: o1zrmHAF">
+                    </div>
+                    <div class="setting-item">
                         <label>DoH 服务器 (用于获取 ECH)</label>
                         <input type="text" id="setting-cf-doh" placeholder="https://223.5.5.5/dns-query">
                     </div>
@@ -253,6 +296,11 @@ exhentai.org" rows="3"></textarea>
                         </div>
                         <div id="ip-tag-container" class="tag-container">
                             <!-- IP tags will be rendered here -->
+                        </div>
+                        <div style="margin-top: 12px; display: flex; gap: 8px;">
+                            <button class="btn btn-primary btn-sm" onclick="manualUpdateIPs()">☁️ 手动更新</button>
+                            <button class="btn btn-secondary btn-sm" onclick="triggerCFHealthCheck()">⚡ 立即测速</button>
+                            <button class="btn btn-secondary btn-sm" onclick="removeInvalidCFIPs()">🧹 清理失效</button>
                         </div>
                         <small style="margin-top: 8px; color: var(--text-secondary);">当规则开启“优选 IP 池”且未指定独立 IP
                             时，将从中随机选择。</small>
@@ -294,8 +342,9 @@ exhentai.org" rows="3"></textarea>
                     <div class="form-group">
                         <label>模式</label>
                         <select id="input-mode">
-                            <option value="mitm">MITM 中间人</option>
-                            <option value="transparent">透传模式</option>
+                            <option value="server">Server 节点 ☁️</option>
+                            <option value="mitm">MITM 中间人 🛡️</option>
+                            <option value="transparent">透传模式 🏃</option>
                         </select>
                     </div>
                     <div class="form-group">
@@ -303,8 +352,15 @@ exhentai.org" rows="3"></textarea>
                         <input type="text" id="input-upstream" placeholder="例如: 8.137.102.117:443">
                     </div>
                     <div class="form-group form-span-2">
-                        <label>SNI 伪造</label>
-                        <input type="text" id="input-snifake" placeholder="可选，用于伪造 SNI">
+                        <label>SNI 伪造（Fake SNI）</label>
+                        <div style="display: flex; gap: 8px; align-items: center;">
+                            <input type="text" id="input-snifake" placeholder="可选，用于伪造 SNI" style="flex: 1;">
+                            <button type="button" class="btn btn-secondary" onclick="generateFakeSNI()" title="根据第一个域名自动生成映射">生成映射</button>
+                        </div>
+                        <small style="color: var(--text-secondary); font-size: 12px; margin-top: 4px; display: block;">
+                            ℹ️ 映射规则：将域名中的 . 替换为 -，并添加 .mapped 后缀<br>
+                            示例：github.com → github-com.mapped
+                        </small>
                     </div>
                     <div class="form-group form-span-2">
                         <label>ECH 优选域名 (DoH 查询源)</label>

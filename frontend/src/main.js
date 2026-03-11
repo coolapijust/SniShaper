@@ -1,15 +1,8 @@
-import './style.css';
-
-import { StartProxy, StopProxy, IsProxyRunning, GetSiteGroups, AddSiteGroup, DeleteSiteGroup, UpdateSiteGroup, ExportConfig, ImportConfigWithSummary, GetCAInstallStatus, OpenCAFile, GetCACertPEM, GetSystemProxyStatus, EnableSystemProxy, DisableSystemProxy, RegenerateCert, ExportCert, GetListenPort, SetListenPort, GetStats, SetProxyMode, GetProxyMode, GetRecentLogs, ClearLogs, ProxySelfCheck, GetProxyDiagnostics, GetRuleHitCounts, GetCloudflareConfig, UpdateCloudflareConfig } from '../wailsjs/go/main/App';
+import { StartProxy, StopProxy, IsProxyRunning, GetSiteGroups, AddSiteGroup, DeleteSiteGroup, UpdateSiteGroup, ExportConfig, ImportConfigWithSummary, GetCAInstallStatus, OpenCAFile, GetCACertPEM, GetSystemProxyStatus, EnableSystemProxy, DisableSystemProxy, RegenerateCert, ExportCert, GetListenPort, SetListenPort, SetProxyMode, GetProxyMode, GetRecentLogs, ClearLogs, ProxySelfCheck, GetProxyDiagnostics, GetCloudflareConfig, UpdateCloudflareConfig, TriggerCFHealthCheck, RemoveInvalidCFIPs, GetCloudflareIPStats, ForceFetchCloudflareIPs, GetServerConfig, UpdateServerConfig } from '../wailsjs/go/main/App';
 import { WindowMinimise, WindowToggleMaximise, Quit } from '../wailsjs/runtime/runtime';
 
 let isRunning = false;
 let systemProxyEnabled = false;
-let statsInterval = null;
-let startTime = null;
-let bytesDown = 0;
-let bytesUp = 0;
-let connections = 0;
 let editingGroupId = null;
 let loggingEnabled = true;
 let backendLogPoll = null;
@@ -37,21 +30,32 @@ function getWebsiteKey(group) {
     return firstDomain.trim() || '未分组';
 }
 
-function formatBytes(bytes) {
-    if (!bytes || bytes < 1024) return bytes + ' B';
-    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
-    if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
-    return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
-}
+// 生成 Fake SNI 映射
+window.generateFakeSNI = function() {
+    const domainsInput = document.getElementById('input-domains').value;
+    const snifakeInput = document.getElementById('input-snifake');
+    
+    if (!domainsInput.trim()) {
+        addLog('warn', '请先填写域名列表');
+        return;
+    }
+    
+    // 获取第一个域名
+    const firstDomain = domainsInput.split('\n').find(d => d.trim())?.trim();
+    if (!firstDomain) {
+        addLog('warn', '未找到有效域名');
+        return;
+    }
+    
+    // 生成映射：将 . 替换为 -，并添加 .mapped 后缀
+    const mapped = firstDomain.replace(/\./g, '-');
+    const fakeSNI = `${mapped}.mapped`;
+    
+    // 填充到输入框
+    snifakeInput.value = fakeSNI;
+    addLog('info', `已生成 Fake SNI: ${fakeSNI}`);
+};
 
-function formatUptime() {
-    if (!startTime) return '00:00:00';
-    const elapsed = Math.floor((Date.now() - startTime) / 1000);
-    const h = Math.floor(elapsed / 3600).toString().padStart(2, '0');
-    const m = Math.floor((elapsed % 3600) / 60).toString().padStart(2, '0');
-    const s = (elapsed % 60).toString().padStart(2, '0');
-    return `${h}:${m}:${s}`;
-}
 
 function updateStatus() {
     const statusEl = document.getElementById('proxy-status');
@@ -98,33 +102,23 @@ window.toggleSystemProxy = async function () {
             systemProxyEnabled = false;
             addLog('info', '系统代理已关闭');
         } else {
+            // 如果代理未运行，先尝试启动代理
             if (!isRunning) {
                 addLog('warn', '系统代理依赖本地代理服务，正在先启动代理...');
                 const mode = document.querySelector('input[name="mode"]:checked').value;
-                await SetProxyMode(mode);
-                await StartProxy();
-                isRunning = true;
-                startTime = Date.now();
-                if (!statsInterval) {
-                    statsInterval = setInterval(async () => {
-                        document.getElementById('stat-uptime').textContent = formatUptime();
-                        try {
-                            const stats = await GetStats();
-                            document.getElementById('stat-downlink').textContent = formatBytes(stats[0]);
-                            document.getElementById('stat-uplink').textContent = formatBytes(stats[1]);
-                            document.getElementById('stat-connections').textContent = stats[2];
-                            const diag = await GetProxyDiagnostics();
-                            const acceptedEl = document.getElementById('stat-accepted');
-                            const connectsEl = document.getElementById('stat-connects');
-                            if (acceptedEl) acceptedEl.textContent = String(diag.Accepted || 0);
-                            if (connectsEl) connectsEl.textContent = String(diag.Connects || 0);
-                        } catch (err) {
-                            console.error('Get stats error:', err);
-                        }
-                    }, 1000);
+                try {
+                    await SetProxyMode(mode);
+                    await StartProxy();
+                    isRunning = true;
+                    addLog('success', '代理服务器已启动');
+                } catch (e) {
+                    addLog('error', '前置代理启动失败: ' + e);
+                    isRunning = false; // 确保状态复位
+                    updateStatus();
+                    return; // 终止后续开启系统代理的操作
                 }
-                updateStatus();
             }
+            // 代理启动成功（或已运行），再设置系统代理
             const port = await GetListenPort();
             await EnableSystemProxy();
             systemProxyEnabled = true;
@@ -134,6 +128,8 @@ window.toggleSystemProxy = async function () {
     } catch (err) {
         console.error('Toggle system proxy error:', err);
         addLog('error', '系统代理设置失败: ' + err);
+        // 如果开启失败，可能需要回滚 systemProxyEnabled 状态?
+        // updateStatus 会根据 systemProxyEnabled 渲染，还是保持现状比较安全
     }
 };
 
@@ -156,29 +152,11 @@ window.startProxy = async function () {
         await SetProxyMode(mode);
         await StartProxy();
         isRunning = true;
-        startTime = Date.now();
-
-        statsInterval = setInterval(async () => {
-            document.getElementById('stat-uptime').textContent = formatUptime();
-            try {
-                const stats = await GetStats();
-                document.getElementById('stat-downlink').textContent = formatBytes(stats[0]);
-                document.getElementById('stat-uplink').textContent = formatBytes(stats[1]);
-                document.getElementById('stat-connections').textContent = stats[2];
-                const diag = await GetProxyDiagnostics();
-                const acceptedEl = document.getElementById('stat-accepted');
-                const connectsEl = document.getElementById('stat-connects');
-                if (acceptedEl) acceptedEl.textContent = String(diag.Accepted || 0);
-                if (connectsEl) connectsEl.textContent = String(diag.Connects || 0);
-            } catch (err) {
-                console.error('Get stats error:', err);
-            }
-        }, 1000);
-
         addLog('info', '代理已启动');
     } catch (err) {
         console.error('Start proxy error:', err);
         addLog('error', '启动失败: ' + err);
+        isRunning = false; // Reset state
     }
     updateStatus();
 };
@@ -192,10 +170,6 @@ window.stopProxy = async function () {
         }
         await StopProxy();
         isRunning = false;
-        if (statsInterval) {
-            clearInterval(statsInterval);
-            statsInterval = null;
-        }
         addLog('info', '代理已停止');
     } catch (err) {
         console.error('Stop proxy error:', err);
@@ -304,15 +278,7 @@ async function refreshBackendLogs() {
 
         const diag = await GetProxyDiagnostics();
         const ingressEl = document.getElementById('ingress-list');
-        if (ingressEl) {
-            ingressEl.textContent = (diag.RecentIngress || []).length > 0
-                ? diag.RecentIngress.join('  |  ')
-                : '暂无';
-        }
-        const acceptedEl = document.getElementById('stat-accepted');
-        const connectsEl = document.getElementById('stat-connects');
-        if (acceptedEl) acceptedEl.textContent = String(diag.Accepted || 0);
-        if (connectsEl) connectsEl.textContent = String(diag.Connects || 0);
+        // Diagnostics cleanup: simplified
     } catch (err) {
         console.error('Refresh backend logs error:', err);
         container.innerHTML = '';
@@ -325,7 +291,7 @@ async function refreshBackendLogs() {
 
 async function loadSiteGroups() {
     try {
-        const [groups, hitMap] = await Promise.all([GetSiteGroups(), GetRuleHitCounts()]);
+        const groups = await GetSiteGroups();
         const container = document.getElementById('rules-list');
         const query = rulesSearchQuery.trim().toLowerCase();
 
@@ -425,8 +391,8 @@ async function loadSiteGroups() {
                             <div class="rule-info">
                                 <div class="rule-name">${group.name || '未命名'}</div>
                                 <div class="rule-domains">${(group.domains || []).join(', ')}</div>
-                                <div class="rule-domains">命中: ${hitMap[group.id] || 0} ${group.ech_enabled ? ' | <span style="color:var(--success)">ECH开启</span>' : ''} ${group.use_cf_pool ? ' | <span style="color:var(--primary)">优选IP</span>' : ''}</div>
-                                <div class="rule-mode">${group.mode === 'mitm' ? 'MITM' : '透传'}${group.upstream ? ' → ' + group.upstream : ''}</div>
+                                <div class="rule-domains">${group.ech_enabled ? '<span style="color:var(--success)">ECH开启</span>' : ''} ${group.use_cf_pool ? '<span style="color:var(--primary)">优选IP</span>' : ''}</div>
+                                <div class="rule-mode">${group.mode === 'server' ? 'Server 节点' : (group.mode === 'mitm' ? 'MITM' : '透传')}${group.upstream ? ' → ' + (group.upstream.length > 40 ? group.upstream.substring(0, 40) + '...' : group.upstream) : ''}</div>
                             </div>
                             <div class="rule-actions">
                                 <button class="btn btn-secondary" onclick="showEditRuleModal('${group.id}')">编辑</button>
@@ -443,7 +409,7 @@ async function loadSiteGroups() {
             return modeColumn;
         };
 
-        const title = rulesViewMode === 'transparent' ? '透传规则' : 'MITM 规则';
+        const title = rulesViewMode === 'server' ? 'Server 节点规则' : (rulesViewMode === 'transparent' ? '透传规则' : 'MITM 规则');
         container.appendChild(buildModeColumn(rulesViewMode, title));
     } catch (err) {
         console.error('Load site groups error:', err);
@@ -470,7 +436,7 @@ window.showAddRuleModal = function () {
     document.getElementById('input-name').value = '';
     document.getElementById('input-website').value = defaults.website || '';
     document.getElementById('input-domains').value = '';
-    document.getElementById('input-mode').value = defaults.mode || 'mitm';
+    document.getElementById('input-mode').value = defaults.mode || 'server';
     document.getElementById('input-upstream').value = '';
     document.getElementById('input-snifake').value = '';
     document.getElementById('input-ech-domain').value = '';
@@ -623,16 +589,14 @@ window.importConfig = function () {
                 const summary = await ImportConfigWithSummary(String(ev.target?.result || ''));
                 addLog('info', `规则配置已导入: ${file.name} (新增 ${summary.added || 0}, 覆盖 ${summary.overwritten || 0}, 跳过 ${summary.skipped || 0})`);
                 await loadSiteGroups();
-                window.alert(`导入成功\n文件: ${file.name}\n新增: ${summary.added || 0}\n覆盖: ${summary.overwritten || 0}\n跳过: ${summary.skipped || 0}`);
+                // Removed alert
             } catch (err) {
                 addLog('error', '导入规则失败: ' + err);
-                window.alert('导入失败: ' + err);
             }
         };
         reader.onerror = () => {
             const msg = '读取文件失败';
             addLog('error', msg + ': ' + file.name);
-            window.alert(msg);
         };
         reader.readAsText(file);
     };
@@ -691,7 +655,7 @@ async function loadCloudflareRules() {
             if (domains.length > 40) domains = domains.substring(0, 40) + '...';
 
             let ip = group.upstream || (group.use_cf_pool ? '全局优选池' : '自动');
-            if (ip.includes(':')) ip = ip.split(':')[0];
+            if (ip.length > 20) ip = ip.substring(0, 20) + '...';
 
             let echSource = group.ech_domain;
             const isDefaultECH = !echSource || echSource === 'crypto.cloudflare.com';
@@ -721,54 +685,278 @@ async function loadCloudflareRules() {
 
 // IP Pool Tagging Logic
 let currentIpPool = [];
+let currentIpStats = [];
 
 async function loadCloudflareConfig() {
     try {
         const config = await GetCloudflareConfig();
         const dohEl = document.getElementById('setting-cf-doh');
         if (dohEl) dohEl.value = config.doh_url || '';
+
+        const autoUpdateEl = document.getElementById('setting-cf-auto-update');
+        if (autoUpdateEl) autoUpdateEl.checked = !!config.auto_update;
+
+        const apiKeyEl = document.getElementById('setting-cf-api-key');
+        if (apiKeyEl) apiKeyEl.value = config.api_key || '';
+
+        // Load generic server config as well
+        if (typeof GetServerConfig === 'function') {
+            const serverConfig = await GetServerConfig();
+            const serverHostEl = document.getElementById('setting-server-host');
+            if (serverHostEl) serverHostEl.value = serverConfig.host || '';
+            const serverAuthEl = document.getElementById('setting-server-auth');
+            if (serverAuthEl) serverAuthEl.value = serverConfig.auth || '';
+        }
+
         currentIpPool = config.preferred_ips || [];
-        renderIpTags();
+
+        // Try to fetch real-time stats
+        try {
+            currentIpStats = await GetCloudflareIPStats() || [];
+        } catch (e) {
+            console.warn("Failed to get IP stats:", e);
+            currentIpStats = [];
+        }
+
+        renderIpGrid();
     } catch (err) {
         console.error('Load CF config error:', err);
     }
 }
 
-function renderIpTags() {
+let lastIpGridData = '';
+
+function renderIpGrid() {
     const container = document.getElementById('ip-tag-container');
     if (!container) return;
+
+    // 1. 差异检测：如果数据没变，跳过重绘以节省性能
+    const rawData = {
+        pool: [...currentIpPool].sort(),
+        stats: currentIpStats.map(s => `${s.ip}:${s.latency}:${s.failures}`).sort()
+    };
+    const currentDataString = JSON.stringify(rawData);
+    if (currentDataString === lastIpGridData) return;
+    lastIpGridData = currentDataString;
+
+    // 2. 执行渲染
+    // Switch container class to grid
+    container.className = 'ip-grid';
     container.innerHTML = '';
 
-    if (currentIpPool.length === 0) {
-        container.innerHTML = '<span style="color: var(--text-secondary); font-size: 12px; font-style: italic;">池中暂无 IP，请在上方输入</span>';
+    // If we have stats, use them (they represent the active pool). 
+    // If stats are empty (e.g. startup), fallback to config pool.
+    // Merge: create a map of IP -> Stat
+    const statsMap = {};
+    if (currentIpStats && currentIpStats.length > 0) {
+        currentIpStats.forEach(s => {
+            statsMap[s.ip] = s;
+        });
     }
 
-    currentIpPool.forEach((ip, index) => {
-        const tag = document.createElement('div');
-        tag.className = 'ip-tag';
-        tag.innerHTML = `
-            <span>${ip}</span>
-            <span class="remove-btn" onclick="removeIpTag(${index})">×</span>
+    const displayIPs = new Set([...currentIpPool]);
+    if (currentIpStats) {
+        currentIpStats.forEach(s => displayIPs.add(s.ip));
+    }
+
+    const list = Array.from(displayIPs);
+
+    if (list.length === 0) {
+        // Remove grid class for empty state to center text
+        container.className = 'tag-container';
+        container.innerHTML = '<span style="color: var(--text-secondary); font-size: 13px; font-style: italic; padding: 20px;">池中暂无 IP，请在上方输入或点击“手动更新”</span>';
+        return;
+    }
+
+    // 批量生成卡片，减少 Reflow
+    const fragment = document.createDocumentFragment();
+    list.forEach((ip) => {
+        const stat = statsMap[ip];
+        let latencyClass = 'checking';
+        let latencyText = 'checking...';
+
+        if (stat) {
+            if (stat.failures >= 3) {
+                latencyClass = 'poor';
+                latencyText = 'failed';
+            } else {
+                const ms = Math.round(stat.latency / 1000000); // ns to ms
+                if (ms > 0) {
+                    if (ms < 100) latencyClass = 'good';
+                    else if (ms < 300) latencyClass = 'fair';
+                    else latencyClass = 'poor';
+                    latencyText = `${ms}ms`;
+                }
+            }
+        }
+
+        const card = document.createElement('div');
+        card.className = 'ip-card';
+        card.innerHTML = `
+            <div class="ip-address">${ip}</div>
+            <div class="ip-meta">
+                <span class="ip-latency ${latencyClass}">${latencyText}</span>
+            </div>
+            <div class="ip-remove" onclick="removeIpTag('${ip}')" title="移除 IP">×</div>
         `;
-        container.appendChild(tag);
+        fragment.appendChild(card);
     });
+    container.appendChild(fragment);
 }
 
-window.removeIpTag = async function (index) {
-    currentIpPool.splice(index, 1);
-    await saveIpPool();
-    renderIpTags();
+window.removeIpTag = async function (ip) {
+    // Remove from config pool
+    const idx = currentIpPool.indexOf(ip);
+    if (idx !== -1) {
+        currentIpPool.splice(idx, 1);
+        await saveCloudflareConfig(); // Persist config removal
+    }
+    await loadCloudflareConfig();
+    renderIpGrid();
+};
+
+// Helper for button loading state
+async function withLoading(btnId, loadingText, action) {
+    const btn = document.querySelector(`button[onclick="${btnId}()"]`) || document.getElementById(btnId);
+    // Fallback: search by onclick attribute text if element not found by ID or Selector
+    let targetBtn = btn;
+    if (!targetBtn) {
+        const buttons = document.querySelectorAll('button');
+        for (let b of buttons) {
+            if (b.getAttribute('onclick') && b.getAttribute('onclick').includes(btnId)) {
+                targetBtn = b;
+                break;
+            }
+        }
+    }
+
+    const originalText = targetBtn ? targetBtn.innerText : '';
+    if (targetBtn) {
+        targetBtn.classList.add('loading');
+        targetBtn.innerText = loadingText;
+    }
+
+    try {
+        await action();
+    } finally {
+        if (targetBtn) {
+            targetBtn.classList.remove('loading');
+            targetBtn.innerText = originalText;
+        }
+    }
+}
+
+window.manualUpdateIPs = async function () {
+    await withLoading('manualUpdateIPs', '更新中...', async () => {
+        try {
+            await ForceFetchCloudflareIPs();
+            addLog('info', '已强制从 API 获取最新优选 IP');
+            await loadCloudflareConfig();
+        } catch (err) {
+            addLog('error', '更新失败: ' + err);
+        }
+    });
 };
 
 async function saveCloudflareConfig() {
     const doh_url = document.getElementById('setting-cf-doh')?.value.trim();
+    const auto_update = document.getElementById('setting-cf-auto-update')?.checked;
+    const api_key = document.getElementById('setting-cf-api-key')?.value.trim();
+
     try {
-        await UpdateCloudflareConfig({ doh_url, preferred_ips: currentIpPool });
-        addLog('info', 'Cloudflare 设置已更新');
+        await UpdateCloudflareConfig({
+            doh_url,
+            preferred_ips: currentIpPool,
+            auto_update: !!auto_update,
+            api_key: api_key || ""
+        });
+
+        // Sync to server config inputs if they are visible in settings (legacy support)
+        const serverHost = document.getElementById('setting-server-host')?.value.trim();
+        const serverAuth = document.getElementById('setting-server-auth')?.value.trim();
+        if (serverHost !== undefined && typeof UpdateServerConfig === 'function') {
+            await UpdateServerConfig(serverHost || "", serverAuth || "");
+        }
+
+        addLog('info', '配置已更新');
     } catch (err) {
-        addLog('error', '保存 Cloudflare 设置失败: ' + err);
+        addLog('error', '保存配置失败: ' + err);
     }
 }
+
+window.saveServerConfig = async function () {
+    const btn = document.getElementById('btn-save-server');
+    const originalText = btn.innerHTML;
+
+    try {
+        btn.disabled = true;
+        btn.innerHTML = '⌛ 保存中...';
+
+        const serverHost = document.getElementById('setting-server-host')?.value.trim();
+        const serverAuth = document.getElementById('setting-server-auth')?.value.trim();
+
+        await UpdateServerConfig(serverHost || "", serverAuth || "");
+
+        btn.innerHTML = '✅ 已保存';
+        addLog('success', 'Server 节点配置持久化成功');
+
+        setTimeout(() => {
+            btn.disabled = false;
+            btn.innerHTML = originalText;
+        }, 1500);
+    } catch (err) {
+        btn.disabled = false;
+        btn.innerHTML = originalText;
+        addLog('error', 'Server 配置保存失败: ' + err);
+    }
+};
+
+window.addServerRule = async function () {
+    const input = document.getElementById('server-input-domains');
+    const domainsRaw = input.value.trim();
+    if (!domainsRaw) {
+        addLog('warn', '请先输入要加速的域名');
+        return;
+    }
+
+    const domains = domainsRaw.split('\n').map(d => d.trim()).filter(d => d);
+    if (domains.length === 0) return;
+
+    try {
+        const count = domains.length;
+        addLog('info', `正在为 ${count} 个域名创建 Server 加速规则...`);
+
+        for (const domain of domains) {
+            // 清理域名，防止带协议头
+            let cleanDomain = domain.replace(/^https?:\/\//, '').replace(/\/$/, '');
+
+            const groupData = {
+                id: 'sg-srv-' + Date.now() + Math.floor(Math.random() * 1000),
+                name: 'Server加速: ' + cleanDomain,
+                website: 'server-batch',
+                domains: [cleanDomain],
+                mode: 'server',
+                upstream: '',
+                sni_fake: '',
+                ech_domain: '',
+                utls_policy: 'on', // 批量添加默认开启强力模式
+                ech_enabled: true,
+                use_cf_pool: true,
+                enabled: true
+            };
+
+            await AddSiteGroup(groupData);
+        }
+
+        addLog('success', `成功添加 ${count} 条加速规则！`);
+        input.value = '';
+        if (document.getElementById('page-rules').style.display !== 'none') {
+            loadSiteGroups();
+        }
+    } catch (err) {
+        addLog('error', '批量添加规则失败: ' + err);
+    }
+};
 
 async function saveIpPool() {
     await saveCloudflareConfig();
@@ -787,7 +975,7 @@ function initIpTagging() {
                 currentIpPool.push(val);
                 input.value = '';
                 await saveIpPool();
-                renderIpTags();
+                await loadCloudflareConfig(); // Refresh stats too?
             } else {
                 addLog('warn', '无效的 IP 格式');
             }
@@ -805,10 +993,46 @@ function initIpTagging() {
     }
 }
 
+window.triggerCFHealthCheck = async function () {
+    await withLoading('triggerCFHealthCheck', '测速中...', async () => {
+        try {
+            await TriggerCFHealthCheck();
+            addLog('info', '已触发 Cloudflare IP 健康检查 (后台运行)');
+            // Auto poll for updates
+            for (let i = 0; i < 8; i++) {
+                await new Promise(r => setTimeout(r, 1000));
+                try {
+                    // Silent update
+                    const stats = await GetCloudflareIPStats() || [];
+                    if (stats.length > 0) {
+                        currentIpStats = stats;
+                        renderIpGrid();
+                    }
+                } catch (e) { }
+            }
+            await loadCloudflareConfig();
+        } catch (err) {
+            addLog('error', '触发失败: ' + err);
+        }
+    });
+};
+
+window.removeInvalidCFIPs = async function () {
+    await withLoading('removeInvalidCFIPs', '清理中...', async () => {
+        try {
+            const count = await RemoveInvalidCFIPs();
+            addLog('info', `已清理 ${count} 个失效 IP`);
+            await loadCloudflareConfig();
+        } catch (err) {
+            addLog('error', '清理失败: ' + err);
+        }
+    });
+};
+
 window.addCloudflareRule = async function () {
     const domainsText = document.getElementById('cf-input-domains').value.trim();
     if (!domainsText) {
-        window.alert("请输入目标域名列表");
+        addLog('warn', "请输入目标域名列表");
         return;
     }
 
@@ -846,9 +1070,7 @@ window.addCloudflareRule = async function () {
 
         loadCloudflareRules();
         addLog('info', `已添加 Cloudflare 规则: ${groupName}`);
-        window.alert("添加成功！");
     } catch (err) {
-        window.alert("添加失败: " + err);
         addLog('error', "添加 Cloudflare 规则失败: " + err);
     }
 };
@@ -860,7 +1082,7 @@ window.deleteCfRule = async function (id) {
         loadCloudflareRules();
         addLog('info', '删除 Cloudflare 规则: ' + id);
     } catch (err) {
-        window.alert("删除失败: " + err);
+        addLog('error', "删除失败: " + err);
     }
 };
 
@@ -943,6 +1165,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             showPage(page);
             if (page === 'cloudflare') loadCloudflareRules();
             if (page === 'settings') loadCloudflareConfig();
+            if (page === 'server') loadCloudflareConfig();
         });
     });
 
@@ -960,12 +1183,21 @@ document.addEventListener('DOMContentLoaded', async () => {
         });
     }
 
+    const modeServerBtn = document.getElementById('rules-mode-server');
     const modeMitmBtn = document.getElementById('rules-mode-mitm');
     const modeTransBtn = document.getElementById('rules-mode-transparent');
     const updateRulesModeButtons = () => {
+        if (modeServerBtn) modeServerBtn.classList.toggle('active', rulesViewMode === 'server');
         if (modeMitmBtn) modeMitmBtn.classList.toggle('active', rulesViewMode === 'mitm');
         if (modeTransBtn) modeTransBtn.classList.toggle('active', rulesViewMode === 'transparent');
     };
+    if (modeServerBtn) {
+        modeServerBtn.addEventListener('click', () => {
+            rulesViewMode = 'server';
+            updateRulesModeButtons();
+            loadSiteGroups();
+        });
+    }
     if (modeMitmBtn) {
         modeMitmBtn.addEventListener('click', () => {
             rulesViewMode = 'mitm';
@@ -1061,4 +1293,90 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     await loadCloudflareConfig();
     document.getElementById('setting-cf-doh')?.addEventListener('change', saveCloudflareConfig);
+    document.getElementById('setting-server-host')?.addEventListener('change', saveCloudflareConfig);
+    document.getElementById('setting-server-auth')?.addEventListener('change', saveCloudflareConfig);
 });
+
+window.saveServerConfig = async function () {
+    const btn = document.getElementById('btn-save-server');
+    if (!btn) return;
+    const originalText = btn.innerHTML;
+
+    try {
+        btn.disabled = true;
+        btn.innerHTML = '⌛ 保存中...';
+
+        const serverHost = document.getElementById('setting-server-host')?.value.trim() || "";
+        const serverAuth = document.getElementById('setting-server-auth')?.value.trim() || "";
+
+        if (typeof UpdateServerConfig !== 'function') {
+            throw new Error('后端绑定函数未找到');
+        }
+
+        await UpdateServerConfig(serverHost, serverAuth);
+
+        btn.innerHTML = '✅ 已保存';
+        addLog('success', 'Server 节点配置已刷新并存入 config.json');
+
+        setTimeout(() => {
+            btn.disabled = false;
+            btn.innerHTML = originalText;
+        }, 1500);
+    } catch (err) {
+        btn.disabled = false;
+        btn.innerHTML = originalText;
+        addLog('error', 'Server 配置保存失败: ' + err);
+        console.error(err);
+    }
+};
+
+window.addServerRule = async function () {
+    const input = document.getElementById('server-input-domains');
+    if (!input) return;
+    const domainsRaw = input.value.trim();
+    if (!domainsRaw) {
+        addLog('warn', '请先输入要加速的域名列表');
+        return;
+    }
+
+    const domains = domainsRaw.split('\n').map(d => d.trim()).filter(d => d);
+    if (domains.length === 0) return;
+
+    try {
+        const count = domains.length;
+        addLog('info', `准备为 ${count} 个域名创建 Server 中转规则...`);
+
+        for (const domain of domains) {
+            let cleanDomain = domain.replace(/^https?:\/\//, '').split('/')[0].trim();
+            if (!cleanDomain) continue;
+
+            const groupData = {
+                id: 'sg-srv-' + Date.now() + Math.floor(Math.random() * 1000),
+                name: 'Server: ' + cleanDomain,
+                website: 'server-batch',
+                domains: [cleanDomain],
+                mode: 'server',
+                upstream: '',
+                sni_fake: '',
+                ech_domain: '',
+                utls_policy: 'on',
+                ech_enabled: true,
+                use_cf_pool: true,
+                enabled: true
+            };
+
+            if (typeof AddSiteGroup === 'function') {
+                await AddSiteGroup(groupData);
+            }
+        }
+
+        addLog('success', `成功批量部署 ${count} 条加速规则！`);
+        input.value = '';
+        if (document.getElementById('page-rules').style.display !== 'none') {
+            loadSiteGroups();
+        }
+    } catch (err) {
+        addLog('error', '批量加速动作失败: ' + err);
+    }
+};
+

@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -25,6 +26,7 @@ import (
 	"time"
 
 	utls "github.com/refraction-networking/utls"
+	"golang.org/x/net/http2"
 )
 
 type CertGenerator interface {
@@ -37,7 +39,6 @@ type ProxyServer struct {
 	Server        *http.Server
 	listenAddr    string
 	rules         *RuleManager
-	stats         *Stats
 	running       bool
 	mode          string // global runtime mode: "mitm" | "transparent"
 	mu            sync.RWMutex
@@ -48,15 +49,17 @@ type ProxyServer struct {
 	recentIngress []string
 	dohResolver   *DoHResolver
 	cfPool        *CloudflarePool
+	transport     *http.Transport
 }
 
 type RuleManager struct {
-	rules      []Rule
-	siteGroups []SiteGroup
-	upstreams  []Upstream
+	rules            []Rule
+	siteGroups       []SiteGroup
+	upstreams        []Upstream
 	configPath       string
-	hitCount         map[string]int64
 	cloudflareConfig CloudflareConfig
+	serverHost       string
+	serverAuth       string
 	mu               sync.RWMutex
 }
 
@@ -88,6 +91,8 @@ type Upstream struct {
 
 type Config struct {
 	ListenPort       string           `json:"listen_port"`
+	ServerHost       string           `json:"server_host,omitempty"`
+	ServerAuth       string           `json:"server_auth,omitempty"`
 	SiteGroups       []SiteGroup      `json:"site_groups"`
 	Upstreams        []Upstream       `json:"upstreams"`
 	CloudflareConfig CloudflareConfig `json:"cloudflare_config"`
@@ -96,31 +101,63 @@ type Config struct {
 type CloudflareConfig struct {
 	PreferredIPs []string `json:"preferred_ips"`
 	DoHURL       string   `json:"doh_url"`
+	AutoUpdate   bool     `json:"auto_update"`
+	APIKey       string   `json:"api_key"`
 }
 
-type Stats struct {
-	BytesIn  int64
-	BytesOut int64
-	Requests int64
-	Accepted int64
-	Connects int64
-	mu       sync.Mutex
-}
 
 type trackingListener struct {
 	net.Listener
 	proxy *ProxyServer
 }
 
+type singleConnListener struct {
+	conn      net.Conn
+	once      sync.Once
+	done      chan struct{}
+	doneOnce  sync.Once
+}
+
+func (l *singleConnListener) Accept() (net.Conn, error) {
+	var accepted bool
+	l.once.Do(func() { accepted = true })
+	if accepted {
+		return &notifyCloseConn{
+			Conn: l.conn,
+			onClose: func() {
+				l.doneOnce.Do(func() { close(l.done) })
+			},
+		}, nil
+	}
+	<-l.done
+	return nil, io.EOF
+}
+func (l *singleConnListener) Close() error {
+	l.doneOnce.Do(func() { close(l.done) })
+	return nil
+}
+func (l *singleConnListener) Addr() net.Addr { return l.conn.LocalAddr() }
+
+type notifyCloseConn struct {
+	net.Conn
+	onClose func()
+}
+
+func (c *notifyCloseConn) Close() error {
+	if c.onClose != nil {
+		c.onClose()
+	}
+	return c.Conn.Close()
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
 func (l *trackingListener) Accept() (net.Conn, error) {
 	conn, err := l.Listener.Accept()
 	if err != nil {
 		return nil, err
 	}
-	if l.proxy != nil {
-		l.proxy.trackAccepted(conn.RemoteAddr().String())
-	}
-	log.Printf("[Ingress] Accepted TCP from %s", conn.RemoteAddr())
 	return conn, nil
 }
 
@@ -176,13 +213,24 @@ func (c *bufferedReadConn) Read(p []byte) (int, error) {
 	return c.reader.Read(p)
 }
 
+// WriteTo must be implemented to prevent io.Copy from using the embedded Conn's WriteTo method,
+// which would bypass c.reader (and the buffered data) and read directly from the file descriptor.
+func (c *bufferedReadConn) WriteTo(w io.Writer) (int64, error) {
+	return io.Copy(w, c.reader)
+}
+
 func wrapHijackedConn(conn net.Conn, rw *bufio.ReadWriter) net.Conn {
 	if rw == nil || rw.Reader == nil || rw.Reader.Buffered() == 0 {
 		return conn
 	}
+	// Extract buffered bytes to avoid sticking with bufio.Reader
+	n := rw.Reader.Buffered()
+	buffered := make([]byte, n)
+	_, _ = rw.Reader.Read(buffered)
+
 	return &bufferedReadConn{
 		Conn:   conn,
-		reader: io.MultiReader(rw.Reader, conn),
+		reader: io.MultiReader(bytes.NewReader(buffered), conn),
 	}
 }
 
@@ -543,22 +591,46 @@ func chooseUpstreamSNI(targetHost string, rule Rule) string {
 }
 
 func NewProxyServer(addr string) *ProxyServer {
-	return &ProxyServer{
+	p := &ProxyServer{
 		listenAddr:  addr,
-		rules:       &RuleManager{},
-		stats:       &Stats{},
-		mode:        "mitm",
-		certCache:   map[string]*tls.Certificate{},
-		Fingerprint: "Chrome",
+		certCache:   make(map[string]*tls.Certificate),
+		Fingerprint: "chrome", // default
+		mode:        "mitm",   // default
+		transport: &http.Transport{
+			Proxy: nil, // We are the proxy
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+			MaxIdleConnsPerHost:   10,
+		},
 		dohResolver: NewDoHResolver(""),
 		cfPool:      NewCloudflarePool([]string{}),
 	}
+	p.rules = NewRuleManager("")
+	return p
 }
 
 func (p *ProxyServer) SetRuleManager(rm *RuleManager) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.rules = rm
+	if rm != nil {
+		cfg := rm.GetCloudflareConfig()
+		if p.dohResolver != nil {
+			p.dohResolver.ServerURL = cfg.DoHURL
+			if p.dohResolver.ServerURL == "" {
+				p.dohResolver.ServerURL = "https://223.5.5.5/dns-query"
+			}
+		}
+		if p.cfPool != nil {
+			p.cfPool.UpdateIPs(cfg.PreferredIPs)
+		}
+	}
+	p.mu.Unlock()
 }
 
 func (p *ProxyServer) SetCertGenerator(cg CertGenerator) {
@@ -581,6 +653,14 @@ func (p *ProxyServer) UpdateCloudflareConfig(cfg CloudflareConfig) {
 	}
 }
 
+func (p *ProxyServer) UpdateCloudflareIPPool(ips []string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.cfPool != nil {
+		p.cfPool.UpdateIPs(ips)
+	}
+}
+
 func (p *ProxyServer) SetListenAddr(addr string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -588,6 +668,32 @@ func (p *ProxyServer) SetListenAddr(addr string) error {
 		return fmt.Errorf("cannot change address while proxy is running")
 	}
 	p.listenAddr = addr
+	return nil
+}
+
+func (p *ProxyServer) TriggerCFHealthCheck() {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.cfPool != nil {
+		p.cfPool.TriggerHealthCheck()
+	}
+}
+
+func (p *ProxyServer) RemoveInvalidCFIPs() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.cfPool != nil {
+		return p.cfPool.RemoveInvalidIPs()
+	}
+	return 0
+}
+
+func (p *ProxyServer) GetAllCFIPsWithStats() []*IPStats {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.cfPool != nil {
+		return p.cfPool.GetAllIPsWithStats()
+	}
 	return nil
 }
 
@@ -630,10 +736,18 @@ func (p *ProxyServer) Start() error {
 		WriteTimeout: 30 * time.Second,
 	}
 	listenAddr := p.listenAddr
+	
+	if p.cfPool != nil {
+		p.cfPool.Start()
+	}
 	p.mu.Unlock()
 
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
+		// Clean up pool if listen fails
+		if p.cfPool != nil {
+			p.cfPool.Stop()
+		}
 		return fmt.Errorf("failed to listen on %s: %w", listenAddr, err)
 	}
 
@@ -674,6 +788,11 @@ func (p *ProxyServer) Stop() error {
 		return nil
 	}
 	p.running = false
+	
+	if p.cfPool != nil {
+		p.cfPool.Stop()
+	}
+
 	if p.Server != nil {
 		return p.Server.Close()
 	}
@@ -687,9 +806,6 @@ func (p *ProxyServer) IsRunning() bool {
 }
 
 func (p *ProxyServer) handleRequest(w http.ResponseWriter, req *http.Request) {
-	p.stats.mu.Lock()
-	p.stats.Requests++
-	p.stats.mu.Unlock()
 
 	host := req.Host
 	if host == "" {
@@ -713,9 +829,6 @@ func (p *ProxyServer) handleRequest(w http.ResponseWriter, req *http.Request) {
 }
 
 func (p *ProxyServer) handleConnect(w http.ResponseWriter, req *http.Request, rule Rule) {
-	p.stats.mu.Lock()
-	p.stats.Connects++
-	p.stats.mu.Unlock()
 
 	targetAuthority := req.URL.Host
 	if targetAuthority == "" {
@@ -764,6 +877,32 @@ func (p *ProxyServer) handleConnect(w http.ResponseWriter, req *http.Request, ru
 		return
 	}
 
+	// 对于 server 模式，直接劫持并使用内置 HTTP 服务解析，不进行原目标拨号
+	if effectiveMode == "server" {
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			http.Error(w, "Hijack not supported", http.StatusInternalServerError)
+			return
+		}
+		clientConn, rw, err := hijacker.Hijack()
+		if err != nil {
+			log.Printf("[Connect] Server hijack failed: %v", err)
+			return
+		}
+		if _, err := rw.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+			clientConn.Close()
+			return
+		}
+		if err := rw.Flush(); err != nil {
+			clientConn.Close()
+			return
+		}
+		clientConn = wrapHijackedConn(clientConn, rw)
+		_ = clientConn.SetDeadline(time.Time{})
+		p.handleServerMITM(clientConn, targetHost, rule)
+		return
+	}
+
 	var conn net.Conn
 	var err error
 	dialAddr := targetAddr
@@ -781,12 +920,22 @@ func (p *ProxyServer) handleConnect(w http.ResponseWriter, req *http.Request, ru
 
 	// Cloudflare Preferred IP Pool integration
 	if rule.UseCFPool && p.cfPool != nil {
-		if preferred := p.cfPool.GetIP(); preferred != "" {
-			preferredAddr := net.JoinHostPort(preferred, "443")
-			// Prepend preferred IP to candidates
-			dialCandidates = append([]string{preferredAddr}, dialCandidates...)
-			dialAddr = preferredAddr
-			log.Printf("[Connect] Using preferred Cloudflare IP: %s for %s", preferred, targetHost)
+		topIPs := p.cfPool.GetTopIPs(5)
+		if len(topIPs) > 0 {
+			var prefs []string
+			for _, ip := range topIPs {
+				prefs = append(prefs, net.JoinHostPort(ip, "443"))
+			}
+
+			if strings.TrimSpace(resolvedUpstream) == "" {
+				// upstream 为空，只用 CF pool IP
+				dialCandidates = prefs
+			} else {
+				// 有配置 upstream，CF pool 作为首选加速项
+				dialCandidates = append(prefs, dialCandidates...)
+			}
+			dialAddr = prefs[0]
+			log.Printf("[Connect] Using %d preferred Cloudflare IPs (best: %s) for %s", len(topIPs), topIPs[0], targetHost)
 		}
 	}
 
@@ -794,44 +943,38 @@ func (p *ProxyServer) handleConnect(w http.ResponseWriter, req *http.Request, ru
 		Timeout:   10 * time.Second,
 		KeepAlive: 30 * time.Second,
 	}
-	// Parallel Dialing (Racing)
+	// 单路稳定性优先（结合顺序回退）
 	if len(dialCandidates) > 1 {
-		type dialResult struct {
-			conn net.Conn
-			err  error
-			addr string
-		}
-		resChan := make(chan dialResult, len(dialCandidates))
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-
+		var lastErr error
 		for _, addr := range dialCandidates {
-			go func(target string) {
-				d := &net.Dialer{Timeout: 5 * time.Second}
-				c, e := d.DialContext(ctx, "tcp", target)
-				select {
-				case resChan <- dialResult{c, e, target}:
-					if e == nil {
-						cancel()
-					}
-				case <-ctx.Done():
-					if c != nil {
-						c.Close()
+			conn, err = dialer.Dial("tcp", addr)
+			if err == nil {
+				dialAddr = addr
+				log.Printf("[Connect] Sequential dial success: %s", dialAddr)
+				
+				// 如果使用了 CF 优选池，回馈成功状态
+				if rule.UseCFPool && p.cfPool != nil {
+					host, _, _ := net.SplitHostPort(addr)
+					if host != "" {
+						p.cfPool.ReportSuccess(host)
 					}
 				}
-			}(addr)
-			time.Sleep(50 * time.Millisecond)
-		}
-
-		for i := 0; i < len(dialCandidates); i++ {
-			r := <-resChan
-			if r.err == nil {
-				conn = r.conn
-				dialAddr = r.addr
-				log.Printf("[Connect] Parallel dial winner: %s", dialAddr)
 				break
 			}
-			err = r.err
+			
+			log.Printf("[Connect] Connect failed to %s: %v", addr, err)
+			lastErr = err
+			
+			// 如果该候选节点连通失败，且来自于 CF 优选池，上报失败实施惩罚
+			if rule.UseCFPool && p.cfPool != nil {
+				host, _, _ := net.SplitHostPort(addr)
+				if host != "" {
+					p.cfPool.ReportFailure(host)
+				}
+			}
+		}
+		if conn == nil {
+			err = lastErr
 		}
 	} else {
 		for _, candidate := range dialCandidates {
@@ -880,7 +1023,7 @@ func (p *ProxyServer) handleConnect(w http.ResponseWriter, req *http.Request, ru
 
 	// 注意：不要在 hijack 后使用 defer，因为我们需要保持连接打开
 	if effectiveMode == "mitm" {
-		p.handleMITM(clientConn, conn, targetHost, rule, dialCandidates, dialAddr)
+		p.handleMITM(clientConn, targetHost, rule, dialCandidates, dialAddr)
 	} else {
 		p.handleTransparent(clientConn, conn, targetHost, rule)
 	}
@@ -918,12 +1061,12 @@ func (p *ProxyServer) directConnect(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	if _, err := rw.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
-		clientConn.Close()
+			clientConn.Close()
 		conn.Close()
 		return
 	}
 	if err := rw.Flush(); err != nil {
-		clientConn.Close()
+			clientConn.Close()
 		conn.Close()
 		return
 	}
@@ -936,18 +1079,14 @@ func (p *ProxyServer) directConnect(w http.ResponseWriter, req *http.Request) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		n, _ := io.Copy(conn, clientConn)
-		p.stats.mu.Lock()
-		p.stats.BytesOut += n
-		p.stats.mu.Unlock()
+		buf := make([]byte, 128*1024)
+		_, _ = io.CopyBuffer(conn, clientConn, buf)
 		conn.Close()
 	}()
 	go func() {
 		defer wg.Done()
-		n, _ := io.Copy(clientConn, conn)
-		p.stats.mu.Lock()
-		p.stats.BytesIn += n
-		p.stats.mu.Unlock()
+		buf := make([]byte, 128*1024)
+		_, _ = io.CopyBuffer(clientConn, conn, buf)
 		clientConn.Close()
 	}()
 	wg.Wait()
@@ -976,16 +1115,21 @@ func (p *ProxyServer) handleHTTP(w http.ResponseWriter, req *http.Request, rule 
 		newReq.Host = newReq.URL.Host
 	}
 
+	// MITM 模式：对于需要 ECH/CF pool 的站点，直接 301 升级到 HTTPS
+	// 避免用直连 transport 访问被封锁的 IP（direct transport 无法用 ECH 或 CF pool IP）
+	if rule.Mode == "mitm" && (rule.ECHEnabled || rule.UseCFPool) && newReq.URL.Scheme == "http" {
+		httpsURL := *newReq.URL
+		httpsURL.Scheme = "https"
+		if httpsURL.Host == "" {
+			httpsURL.Host = req.Host
+		}
+		http.Redirect(w, req, httpsURL.String(), http.StatusMovedPermanently)
+		return
+	}
+
 	if rule.Mode == "direct" {
 		// 直接转发请求
-		transport := &http.Transport{
-			DialContext: (&net.Dialer{
-				Timeout:   30 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
-		}
-
-		resp, err := transport.RoundTrip(newReq)
+		resp, err := p.transport.RoundTrip(newReq)
 		if err != nil {
 			log.Printf("[HTTP] Direct proxy failed: %v", err)
 			http.Error(w, "Failed to proxy", http.StatusBadGateway)
@@ -1015,14 +1159,7 @@ func (p *ProxyServer) handleHTTP(w http.ResponseWriter, req *http.Request, rule 
 		}
 	}
 
-	transport := &http.Transport{
-		DialContext: (&net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
-	}
-
-	resp, err := transport.RoundTrip(newReq)
+	resp, err := p.transport.RoundTrip(newReq)
 	if err != nil {
 		log.Printf("[HTTP] HTTPS proxy failed: %v", err)
 		http.Error(w, "Failed to proxy", http.StatusBadGateway)
@@ -1037,18 +1174,15 @@ func (p *ProxyServer) handleHTTP(w http.ResponseWriter, req *http.Request, rule 
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	n, _ := io.Copy(w, resp.Body)
-	p.stats.mu.Lock()
-	p.stats.BytesIn += n
-	p.stats.mu.Unlock()
+	_, _ = io.Copy(w, resp.Body)
 }
 
-func (p *ProxyServer) handleMITM(clientConn, upstreamConn net.Conn, host string, rule Rule, dialCandidates []string, initialDialAddr string) {
+func (p *ProxyServer) handleMITM(clientConn net.Conn, host string, rule Rule, dialCandidates []string, initialDialAddr string) {
 	log.Printf("[MITM] Handling %s with SNI: %s", host, rule.SniFake)
 
 	if p.certGenerator == nil {
 		log.Printf("[MITM] No cert generator, falling back to direct")
-		p.directTunnel(clientConn, upstreamConn)
+		p.directTunnel(clientConn, clientConn)
 		return
 	}
 
@@ -1057,25 +1191,54 @@ func (p *ProxyServer) handleMITM(clientConn, upstreamConn net.Conn, host string,
 	if caCert == nil || caKey == nil {
 		log.Printf("[MITM] CA cert/key not available")
 		clientConn.Close()
-		upstreamConn.Close()
 		return
 	}
+
+	sniHost := chooseUpstreamSNI(host, rule)
+	log.Printf("[MITM] Upstream handshake SNI selected: %s", sniHost)
+
+	orderedCandidates := make([]string, 0, len(dialCandidates)+1)
+	if strings.TrimSpace(initialDialAddr) != "" {
+		orderedCandidates = append(orderedCandidates, initialDialAddr)
+	}
+	for _, c := range dialCandidates {
+		if strings.TrimSpace(c) == "" || c == initialDialAddr {
+			continue
+		}
+		orderedCandidates = append(orderedCandidates, c)
+	}
+
+	upstreamRW, upstreamProtocol, err := p.establishUpstreamConn(host, rule, orderedCandidates, "")
+	if err != nil {
+		log.Printf("[MITM] Failed to establish upstream: %v", err)
+		clientConn.Close()
+		return
+	}
+	defer upstreamRW.Close()
+
+	if upstreamRW == nil {
+		log.Printf("[MITM] No usable upstream")
+		clientConn.Close()
+		return
+	}
+
+	log.Printf("[MITM] Upstream negotiated protocol: %s", upstreamProtocol)
 
 	cert, err := p.generateCert(host, caCert, caKey)
 	if err != nil {
 		log.Printf("[MITM] Failed to generate cert: %v", err)
 		clientConn.Close()
-		upstreamConn.Close()
+		upstreamRW.Close()
 		return
 	}
 
-	alpnPolicy := strings.ToLower(strings.TrimSpace(rule.AlpnPolicy))
-	clientNextProtos := []string{"h2", "http/1.1"}
-	if alpnPolicy == "h1_only" {
+	clientNextProtos := []string{upstreamProtocol}
+	if upstreamProtocol == "" {
 		clientNextProtos = []string{"http/1.1"}
-	}
-	if alpnPolicy == "h2_h1" {
+	} else if upstreamProtocol == "h2" {
 		clientNextProtos = []string{"h2", "http/1.1"}
+	} else {
+		clientNextProtos = []string{"http/1.1"}
 	}
 
 	tlsConfig := &tls.Config{
@@ -1087,245 +1250,36 @@ func (p *ProxyServer) handleMITM(clientConn, upstreamConn net.Conn, host string,
 	if err := clientTls.Handshake(); err != nil {
 		log.Printf("[MITM] Client TLS handshake failed: %v", err)
 		clientConn.Close()
-		upstreamConn.Close()
-		return
-	}
-	clientALPN := clientTls.ConnectionState().NegotiatedProtocol
-
-	sniHost := chooseUpstreamSNI(host, rule)
-	log.Printf("[MITM] Upstream handshake SNI selected: %s, client ALPN: %s", sniHost, clientALPN)
-
-	orderedCandidates := make([]string, 0, len(dialCandidates))
-	if strings.TrimSpace(initialDialAddr) != "" {
-		orderedCandidates = append(orderedCandidates, initialDialAddr)
-	}
-	for _, c := range dialCandidates {
-		if strings.TrimSpace(c) == "" || c == initialDialAddr {
-			continue
-		}
-		orderedCandidates = append(orderedCandidates, c)
-	}
-	if len(orderedCandidates) == 0 {
-		orderedCandidates = append(orderedCandidates, net.JoinHostPort(host, "443"))
-	}
-
-	var upstreamRW io.ReadWriteCloser
-	var lastErr error
-	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
-	utlsPolicy := strings.ToLower(strings.TrimSpace(rule.UTLSPolicy))
-	sniPolicy := strings.ToLower(strings.TrimSpace(rule.SniPolicy))
-	effectiveFakeSNI := strings.TrimSpace(rule.SniFake) != "" || (sniPolicy == "fake" && strings.TrimSpace(sniHost) != "" && !strings.EqualFold(strings.TrimSpace(sniHost), strings.TrimSpace(host)))
-
-	for idx, candidate := range orderedCandidates {
-		var rawConn net.Conn
-		var err error
-		// Parallel Dialing (Racing)
-		// If multiple candidates, try them in parallel with a slight delay (Happy Eyeballs style)
-		// For now, simpler implementation: if more than 1 candidate, use a racing helper.
-		if len(orderedCandidates) > 1 {
-			type dialResult struct {
-				conn net.Conn
-				err  error
-				addr string
-			}
-			resChan := make(chan dialResult, len(orderedCandidates))
-			ctx, cancel := context.WithCancel(context.Background())
-			
-			for _, addr := range orderedCandidates {
-				go func(target string) {
-					d := &net.Dialer{Timeout: 5 * time.Second}
-					c, e := d.DialContext(ctx, "tcp", target)
-					select {
-					case resChan <- dialResult{c, e, target}:
-						if e == nil {
-							cancel() // Stop others if we won
-						}
-					case <-ctx.Done():
-						if c != nil {
-							c.Close()
-						}
-					}
-				}(addr)
-				// Slight delay before launching the next one to prefer order but minimize total wait
-				time.Sleep(50 * time.Millisecond)
-			}
-
-			var winner dialResult
-			count := 0
-			for i := 0; i < len(orderedCandidates); i++ {
-				r := <-resChan
-				count++
-				if r.err == nil {
-					winner = r
-					break
-				}
-				lastErr = r.err
-			}
-			cancel() // Final cleanup
-			
-			if winner.conn != nil {
-				rawConn = winner.conn
-				candidate = winner.addr
-				log.Printf("[MITM] Parallel dial winner: %s", candidate)
-			} else {
-				break // All failed
-			}
-		} else {
-			// Single candidate logic
-			if idx == 0 && upstreamConn != nil && candidate == initialDialAddr {
-				rawConn = upstreamConn
-			} else {
-				rawConn, err = dialer.Dial("tcp", candidate)
-				if err != nil {
-					lastErr = err
-					log.Printf("[MITM] Upstream dial failed %s: %v", candidate, err)
-					continue
-				}
-			}
-		}
-		
-		_ = rawConn.SetDeadline(time.Time{})
-
-		useUTLS := false
-		switch utlsPolicy {
-		case "off":
-			useUTLS = false
-		case "on":
-			useUTLS = true
-		default: // auto / empty
-			useUTLS = effectiveFakeSNI
-		}
-
-		if useUTLS {
-			upstreamALPN := strings.TrimSpace(clientALPN)
-			if upstreamALPN == "" {
-				upstreamALPN = "http/1.1"
-			}
-
-			var echConfig []byte
-			if rule.ECHEnabled && p.dohResolver != nil {
-				// Use ECHDomain if configured, otherwise use original host
-				echLookupDomain := rule.ECHDomain
-				if echLookupDomain == "" {
-					echLookupDomain = host
-				}
-				log.Printf("[MITM] Attempting ECH fetch for %s (using %s)", host, echLookupDomain)
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				if val, err := p.dohResolver.ResolveECH(ctx, echLookupDomain); err == nil {
-					echConfig = val
-					log.Printf("[MITM] ECH config fetched successfully (%d bytes)", len(echConfig))
-				} else {
-					log.Printf("[MITM] ECH fetch failed: %v", err)
-				}
-				cancel()
-			}
-
-			// If ECH is enabled and config is present/tried, allow uTLS to handle outer SNI.
-			// The ServerName given to uTLS MUST be the real target (Inner SNI).
-			// If we kept `sniHost` as `linux-do` (from fake policy), ECH would imply `linux-do` as the standard SNI, which fails.
-			targetSNI := sniHost
-			if len(echConfig) > 0 {
-				targetSNI = host
-			}
-
-			uconn := p.GetUConn(rawConn, targetSNI, true, upstreamALPN, echConfig)
-			if err := uconn.Handshake(); err == nil {
-				negotiated := uconn.ConnectionState().NegotiatedProtocol
-				if upstreamALPN != "" && negotiated != upstreamALPN {
-					lastErr = fmt.Errorf("utls alpn mismatch want=%s got=%s", upstreamALPN, negotiated)
-					log.Printf("[MITM] Upstream uTLS ALPN mismatch on %s: want=%s got=%s", candidate, upstreamALPN, negotiated)
-					_ = uconn.Close()
-				} else {
-					log.Printf("[MITM] Upstream (uTLS) negotiated ALPN: %s via %s", negotiated, candidate)
-					upstreamRW = uconn
-					break
-				}
-			} else {
-				lastErr = err
-				log.Printf("[MITM] Upstream uTLS handshake failed on %s: %v", candidate, err)
-			}
-		}
-
-		if upstreamRW == nil {
-			upTLSConfig := &tls.Config{
-				ServerName:         sniHost,
-				InsecureSkipVerify: true,
-			}
-			switch alpnPolicy {
-			case "h1_only":
-				upTLSConfig.NextProtos = []string{"http/1.1"}
-			case "h2_h1":
-				upTLSConfig.NextProtos = []string{"h2", "http/1.1"}
-			default:
-				if strings.TrimSpace(clientALPN) != "" {
-					upTLSConfig.NextProtos = []string{clientALPN}
-				} else {
-					upTLSConfig.NextProtos = []string{"http/1.1"}
-				}
-			}
-			upstreamTLS := tls.Client(rawConn, upTLSConfig)
-			if err := upstreamTLS.Handshake(); err != nil {
-				lastErr = err
-				log.Printf("[MITM] Upstream TLS handshake failed on %s: %v", candidate, err)
-				_ = rawConn.Close()
-				continue
-			}
-			log.Printf("[MITM] Upstream (std TLS) negotiated ALPN: %s via %s", upstreamTLS.ConnectionState().NegotiatedProtocol, candidate)
-			upstreamRW = upstreamTLS
-			break
-		}
-	}
-
-	if upstreamRW == nil {
-		log.Printf("[MITM] No usable upstream candidate, last err: %v", lastErr)
-		clientTls.Close()
-		if upstreamConn != nil {
-			upstreamConn.Close()
-		}
-		return
-	}
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		n, _ := io.Copy(upstreamRW, clientTls)
-		p.stats.mu.Lock()
-		p.stats.BytesOut += n
-		p.stats.mu.Unlock()
 		upstreamRW.Close()
-	}()
-	go func() {
-		defer wg.Done()
-		n, _ := io.Copy(clientTls, upstreamRW)
-		p.stats.mu.Lock()
-		p.stats.BytesIn += n
-		p.stats.mu.Unlock()
-		clientTls.Close()
-	}()
-	wg.Wait()
+		return
+	}
+
+	clientALPN := clientTls.ConnectionState().NegotiatedProtocol
+	log.Printf("[MITM] Client ALPN: %s, Upstream Protocol: %s", clientALPN, upstreamProtocol)
+
+	p.directTunnel(clientTls, upstreamRW)
 }
 
 func (p *ProxyServer) directTunnel(clientConn, upstreamConn net.Conn) {
+	log.Printf("[Tunnel] Starting direct tunnel")
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		n, _ := io.Copy(upstreamConn, clientConn)
-		p.stats.mu.Lock()
-		p.stats.BytesOut += n
-		p.stats.mu.Unlock()
+		buf := make([]byte, 128*1024)
+		n, err := io.CopyBuffer(upstreamConn, clientConn, buf)
+		log.Printf("[Tunnel] Client -> Upstream: %d bytes, err: %v", n, err)
 		upstreamConn.Close()
 	}()
 	go func() {
 		defer wg.Done()
-		n, _ := io.Copy(clientConn, upstreamConn)
-		p.stats.mu.Lock()
-		p.stats.BytesIn += n
-		p.stats.mu.Unlock()
+		buf := make([]byte, 128*1024)
+		n, err := io.CopyBuffer(clientConn, upstreamConn, buf)
+		log.Printf("[Tunnel] Upstream -> Client: %d bytes, err: %v", n, err)
 		clientConn.Close()
 	}()
 	wg.Wait()
+	log.Printf("[Tunnel] Tunnel closed")
 }
 
 func (p *ProxyServer) generateCert(host string, caCert *x509.Certificate, caKey interface{}) (*tls.Certificate, error) {
@@ -1398,42 +1352,46 @@ func (r *RuleManager) matchRule(host, mode string) Rule {
 
 	host = normalizeHost(host)
 	mode = strings.ToLower(strings.TrimSpace(mode))
+	
 	best := Rule{}
 	bestScore := -1
 	for _, rule := range r.rules {
 		if !rule.Enabled {
 			continue
 		}
-		// Enforce global runtime mode so UI mode switch actually changes traffic handling.
-		if mode == "mitm" || mode == "transparent" {
-			if rule.Mode != mode {
-				continue
-			}
-		}
+		
 		score := domainMatchScore(host, rule.Domain)
 		if score >= 0 && score > bestScore {
 			best = rule
 			bestScore = score
 		}
 	}
+	
+	// 如果命中了特定规则
 	if bestScore >= 0 {
+		// [V2.9.4 特殊逻辑]：如果用户开启了全局“透传模式”，说明用户可能没装证书。
+		// 此时如果命中了标记为 MITM 的规则，直接让它走“直连（Direct）”，而不是尝试透传或中间人，
+		// 从而彻底避免因为劫持而产生的证书报错。
+		if mode == "transparent" && best.Mode == "mitm" {
+			log.Printf("[RuleMatch] Global Transparent detected: Downgrading MITM rule (%s) to DIRECT to avoid cert errors.", host)
+			best.Mode = "direct"
+		}
 		return best
 	}
 
-	return Rule{Mode: "direct", Enabled: true}
+	// 如果没有命中任何特定规则，则使用全局模式作为默认策略
+	// 注意：如果全局模式是 "mitm" 或 "transparent"，则返回对应的基础 Rule
+	return Rule{
+		Mode:    mode,
+		Enabled: true,
+	}
 }
 
 func (p *ProxyServer) GetStats() (int64, int64, int64) {
-	p.stats.mu.Lock()
-	defer p.stats.mu.Unlock()
-	return p.stats.BytesIn, p.stats.BytesOut, p.stats.Requests
+	return 0, 0, 0
 }
 
 func (p *ProxyServer) trackAccepted(remote string) {
-	p.stats.mu.Lock()
-	p.stats.Accepted++
-	p.stats.mu.Unlock()
-
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if len(p.recentIngress) >= 10 {
@@ -1443,23 +1401,13 @@ func (p *ProxyServer) trackAccepted(remote string) {
 }
 
 func (p *ProxyServer) GetDiagnostics() (int64, int64, int64, []string) {
-	p.stats.mu.Lock()
-	accepted := p.stats.Accepted
-	requests := p.stats.Requests
-	connects := p.stats.Connects
-	p.stats.mu.Unlock()
-
-	p.mu.RLock()
-	recent := append([]string(nil), p.recentIngress...)
-	p.mu.RUnlock()
-	return accepted, requests, connects, recent
+	return 0, 0, 0, nil
 }
 
 func NewRuleManager(configPath string) *RuleManager {
 	return &RuleManager{
 		configPath: configPath,
 		rules:      []Rule{},
-		hitCount:   map[string]int64{},
 	}
 }
 
@@ -1479,7 +1427,12 @@ func (rm *RuleManager) LoadConfig() error {
 
 	rm.siteGroups = config.SiteGroups
 	rm.upstreams = config.Upstreams
+	if rm.upstreams == nil {
+		rm.upstreams = []Upstream{}
+	}
 	rm.cloudflareConfig = config.CloudflareConfig
+	rm.serverHost = config.ServerHost
+	rm.serverAuth = config.ServerAuth
 
 	// Sync Cloudflare Config if ProxyServer is linked
 	// Note: In current architecture, RuleManager doesn't have a back-pointer to ProxyServer.
@@ -1590,16 +1543,39 @@ func loadEmbeddedRules() ([]SiteGroup, []Upstream, error) {
 
 func (rm *RuleManager) buildRules() {
 	rm.rules = []Rule{}
+	upstreamMap := make(map[string]string)
+	for _, up := range rm.upstreams {
+		if up.Enabled && up.Address != "" {
+			upstreamMap[up.ID] = up.Address
+		}
+	}
+
 	for _, sg := range rm.siteGroups {
 		if !sg.Enabled {
 			continue
 		}
+
+		// Resolve upstream ID to actual address
+		resolvedUpstream := sg.Upstream
+		if addr, ok := upstreamMap[sg.Upstream]; ok {
+			resolvedUpstream = addr
+		}
+
+		resolvedUpstreams := make([]string, 0, len(sg.Upstreams))
+		for _, upId := range sg.Upstreams {
+			if addr, ok := upstreamMap[upId]; ok {
+				resolvedUpstreams = append(resolvedUpstreams, addr)
+			} else {
+				resolvedUpstreams = append(resolvedUpstreams, upId)
+			}
+		}
+
 		for _, domain := range sg.Domains {
 			rule := Rule{
 				Domain:        domain,
 				Mode:          sg.Mode,
-				Upstream:      sg.Upstream,
-				Upstreams:     append([]string(nil), sg.Upstreams...),
+				Upstream:      resolvedUpstream,
+				Upstreams:     resolvedUpstreams,
 				SniFake:       sg.SniFake,
 				ConnectPolicy: strings.TrimSpace(sg.ConnectPolicy),
 				SniPolicy:     strings.TrimSpace(sg.SniPolicy),
@@ -1617,28 +1593,37 @@ func (rm *RuleManager) buildRules() {
 }
 
 func (rm *RuleManager) incrementRuleHit(siteID string) {
-	if siteID == "" {
-		return
-	}
-	rm.mu.Lock()
-	rm.hitCount[siteID]++
-	rm.mu.Unlock()
+	// No-op after stats removal
 }
 
 func (rm *RuleManager) GetRuleHitCounts() map[string]int64 {
-	rm.mu.RLock()
-	defer rm.mu.RUnlock()
-	out := make(map[string]int64, len(rm.hitCount))
-	for k, v := range rm.hitCount {
-		out[k] = v
-	}
-	return out
+	return map[string]int64{}
 }
 
 func (rm *RuleManager) GetSiteGroups() []SiteGroup {
 	rm.mu.RLock()
 	defer rm.mu.RUnlock()
 	return rm.siteGroups
+}
+
+func (rm *RuleManager) GetServerHost() string {
+	rm.mu.RLock()
+	defer rm.mu.RUnlock()
+	return rm.serverHost
+}
+
+func (rm *RuleManager) GetServerAuth() string {
+	rm.mu.RLock()
+	defer rm.mu.RUnlock()
+	return rm.serverAuth
+}
+
+func (rm *RuleManager) UpdateServerConfig(host, auth string) error {
+	rm.mu.Lock()
+	rm.serverHost = host
+	rm.serverAuth = auth
+	rm.mu.Unlock()
+	return rm.saveConfig()
 }
 
 func (rm *RuleManager) GetCloudflareConfig() CloudflareConfig {
@@ -1738,6 +1723,8 @@ func (rm *RuleManager) DeleteUpstream(id string) error {
 func (rm *RuleManager) saveConfig() error {
 	config := Config{
 		ListenPort:       "8080",
+		ServerHost:       rm.serverHost,
+		ServerAuth:       rm.serverAuth,
 		SiteGroups:       rm.siteGroups,
 		Upstreams:        rm.upstreams,
 		CloudflareConfig: rm.cloudflareConfig,
@@ -1756,15 +1743,25 @@ func generateID() string {
 }
 
 func (p *ProxyServer) GetUConn(conn net.Conn, sni string, allowInsecure bool, alpn string, echConfig []byte) *utls.UConn {
+	nextProtos := []string{"h2", "http/1.1"}
+	if strings.EqualFold(strings.TrimSpace(alpn), "http/1.1") {
+		nextProtos = []string{"http/1.1"}
+	}
+
 	config := &utls.Config{
+		// ECH 下这里必须是内层真实 SNI。外层公开名由 ECHConfig 的 PublicName 驱动。
 		ServerName:                     sni,
 		InsecureSkipVerify:             allowInsecure,
 		EncryptedClientHelloConfigList: echConfig,
+		NextProtos:                     nextProtos,
 	}
-	if strings.TrimSpace(alpn) != "" {
-		config.NextProtos = []string{alpn}
-	} else {
-		config.NextProtos = []string{"http/1.1"}
+
+	if allowInsecure && len(echConfig) > 0 {
+		// ECH 成功后证书可能呈现 public_name 相关名称，跳过 hostname 验证避免误报。
+		config.InsecureServerNameToVerify = "*"
+		config.VerifyPeerCertificate = func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+			return nil
+		}
 	}
 
 	clientHelloID := utls.HelloChrome_Auto
@@ -1773,4 +1770,296 @@ func (p *ProxyServer) GetUConn(conn net.Conn, sni string, allowInsecure bool, al
 	}
 	uconn := utls.UClient(conn, config, clientHelloID)
 	return uconn
+}
+
+func (p *ProxyServer) handleServerMITM(clientConn net.Conn, host string, rule Rule) {
+	defer clientConn.Close()
+	log.Printf("[ServerMode] Handling %s via Server", host)
+
+	if p.certGenerator == nil {
+		log.Printf("[ServerMode] No cert generator available")
+		return
+	}
+	caCert := p.certGenerator.GetCACert()
+	caKey := p.certGenerator.GetCAKey()
+	cert, err := p.generateCert(host, caCert, caKey)
+	if err != nil {
+		log.Printf("[ServerMode] Cert error: %v", err)
+		return
+	}
+
+	// 强制客户端侧使用 HTTP/1.1，避免单连接被升级为 HTTP/2 后的多路复用处理复杂化
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{*cert},
+		NextProtos:   []string{"http/1.1"},
+	}
+	clientTls := tls.Server(clientConn, tlsConfig)
+	if err := clientTls.Handshake(); err != nil {
+		log.Printf("[ServerMode] TLS handshake failed: %v", err)
+		return
+	}
+
+	serverHost := p.rules.serverHost
+	if serverHost == "" {
+		log.Printf("[ServerMode] ServerHost not configured")
+		return
+	}
+
+	dialCandidates := []string{}
+	seen := map[string]struct{}{}
+	if rule.UseCFPool && p.cfPool != nil {
+		topIPs := p.cfPool.GetTopIPs(5)
+		for _, ip := range topIPs {
+			addr := net.JoinHostPort(ip, "443")
+			if _, ok := seen[addr]; ok {
+				continue
+			}
+			seen[addr] = struct{}{}
+			dialCandidates = append(dialCandidates, addr)
+		}
+	}
+	serverAddr := net.JoinHostPort(serverHost, "443")
+	if _, ok := seen[serverAddr]; !ok {
+		dialCandidates = append(dialCandidates, serverAddr)
+	}
+
+	upstreamConn, upstreamProtocol, err := p.establishUpstreamConn(serverHost, rule, dialCandidates, "http/1.1")
+	if err != nil {
+		log.Printf("[ServerMode] Failed to establish upstream connection: %v", err)
+		return
+	}
+	defer upstreamConn.Close()
+
+	log.Printf("[ServerMode] Upstream protocol: %s", upstreamProtocol)
+
+	var uconn *utls.UConn
+	if uc, ok := upstreamConn.(*utls.UConn); ok {
+		uconn = uc
+	}
+
+	var transport http.RoundTripper
+	if upstreamProtocol == "h2" || (uconn != nil && uconn.ConnectionState().NegotiatedProtocol == "h2") {
+		cs := uconn.ConnectionState()
+		peerCN := ""
+		if len(cs.PeerCertificates) > 0 {
+			peerCN = cs.PeerCertificates[0].Subject.CommonName
+		}
+		log.Printf("[ServerMode] Upstream uTLS negotiated: alpn=%s echAccepted=%v peerCN=%s", cs.NegotiatedProtocol, cs.ECHAccepted, peerCN)
+		t2 := &http2.Transport{}
+		c2, err := t2.NewClientConn(uconn)
+		if err != nil {
+			log.Printf("[ServerMode] H2 wrapper failed: %v", err)
+			return
+		}
+		transport = roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			return c2.RoundTrip(req)
+		})
+	} else {
+		transport = &http.Transport{
+			DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return upstreamConn, nil
+			},
+		}
+	}
+
+	client := &http.Client{
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			targetUrl := "https://" + host + req.URL.Path
+			if req.URL.RawQuery != "" {
+				targetUrl += "?" + req.URL.RawQuery
+			}
+            
+			path := req.URL.EscapedPath()
+			if path == "" || !strings.HasPrefix(path, "/") {
+				path = "/" + strings.TrimPrefix(path, "/")
+			}
+			
+			workerUrlStr := "https://" + serverHost + "/" + p.rules.serverAuth + "/" + host + path
+			if req.URL.RawQuery != "" {
+				workerUrlStr += "?" + req.URL.RawQuery
+			}
+
+			newReq, err := http.NewRequest(req.Method, workerUrlStr, req.Body)
+            if err != nil {
+                http.Error(w, "Bad request", http.StatusInternalServerError)
+                return
+            }
+
+			for k, vv := range req.Header {
+				for _, v := range vv {
+					newReq.Header.Add(k, v)
+				}
+			}
+			newReq.Host = serverHost
+			log.Printf("[ServerMode] Forward request method=%s workerURL=%s host=%s target=%s contentLength=%d", req.Method, workerUrlStr, newReq.Host, targetUrl, req.ContentLength)
+
+			hopByHop := []string{"Connection", "Proxy-Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization", "Te", "Trailer", "Transfer-Encoding", "Upgrade"}
+			for _, h := range hopByHop {
+				newReq.Header.Del(h)
+			}
+
+			resp, err := client.Do(newReq)
+			if err != nil {
+                log.Printf("[ServerMode] Forwarding error method=%s workerURL=%s host=%s target=%s err=%v", req.Method, workerUrlStr, newReq.Host, targetUrl, err)
+				http.Error(w, "Proxy error", http.StatusBadGateway)
+				return
+			}
+			defer resp.Body.Close()
+			log.Printf("[ServerMode] Upstream response status=%d target=%s", resp.StatusCode, targetUrl)
+
+			for k, vv := range resp.Header {
+				for _, v := range vv {
+					w.Header().Add(k, v)
+				}
+			}
+			w.WriteHeader(resp.StatusCode)
+			io.Copy(w, resp.Body)
+		}),
+	}
+	
+	_ = srv.Serve(&singleConnListener{conn: clientTls, done: make(chan struct{})})
+}
+
+// establishUpstreamConn 整合多节点拨号、优选 IP、uTLS 握手及 ECH 自动提取逻辑
+func (p *ProxyServer) establishUpstreamConn(host string, rule Rule, dialCandidates []string, initialALPN string) (net.Conn, string, error) {
+	// 1. 确定拨号地址
+	ordered := dialCandidates
+	if len(ordered) == 0 {
+		ordered = []string{net.JoinHostPort(host, "443")}
+	}
+
+	// 2. 预计算握手参数（按候选逐个握手重试）
+	baseDialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	utlsPolicy := strings.ToLower(strings.TrimSpace(rule.UTLSPolicy))
+	sniPolicy := strings.ToLower(strings.TrimSpace(rule.SniPolicy))
+	sniHost := chooseUpstreamSNI(host, rule)
+	effectiveFakeSNI := strings.TrimSpace(rule.SniFake) != "" || (sniPolicy == "fake" && strings.TrimSpace(sniHost) != "" && !strings.EqualFold(strings.TrimSpace(sniHost), strings.TrimSpace(host)))
+
+	useUTLS := false
+	switch utlsPolicy {
+	case "off": useUTLS = false
+	case "on":  useUTLS = true
+	default:    useUTLS = effectiveFakeSNI || rule.ECHEnabled
+	}
+
+	upstreamALPN := initialALPN
+	if upstreamALPN == "" {
+		upstreamALPN = "h2_h1"
+	}
+
+	var echConfig []byte
+	if useUTLS && rule.ECHEnabled && p.dohResolver != nil {
+		echLookupDomain := rule.ECHDomain
+		if echLookupDomain == "" {
+			echLookupDomain = host
+		}
+		log.Printf("[Upstream] Fetching ECH for %s (via %s)", host, echLookupDomain)
+		echCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		echConfig, _ = p.dohResolver.ResolveECH(echCtx, echLookupDomain)
+		cancel()
+		if len(echConfig) > 0 {
+			log.Printf("[Upstream] ECH Hijacked/Fetched (%d bytes)", len(echConfig))
+		}
+	}
+
+	// 3. 按候选逐个拨号+握手（关键：握手失败也要尝试下一个候选）
+	var errs []string
+	for _, addr := range ordered {
+		rawConn, dialErr := baseDialer.Dial("tcp", addr)
+		if dialErr != nil {
+			errs = append(errs, fmt.Sprintf("%s dial: %v", addr, dialErr))
+			if rule.UseCFPool && p.cfPool != nil {
+				h, _, _ := net.SplitHostPort(addr)
+				if h != "" {
+					p.cfPool.ReportFailure(h)
+				}
+			}
+			continue
+		}
+
+		if useUTLS {
+			targetSNI := sniHost
+			// [ECH 挪用专用] 如果获取到了 ECH 公钥，说明我们要开启隐身模式。
+			// 此时 targetSNI 不应是业务域名，而应是 ECH 公钥的主人域名，
+			// 这样握手过程中的 inner-client-hello 才能通过 cloudflare 的校验。
+			if len(echConfig) > 0 {
+				targetSNI = host
+			}
+
+			uconn := p.GetUConn(rawConn, targetSNI, true, upstreamALPN, echConfig)
+			utlsErr := uconn.Handshake()
+			if utlsErr == nil {
+				cs := uconn.ConnectionState()
+				peerCN := ""
+				peerSAN := ""
+				if len(cs.PeerCertificates) > 0 {
+					peerCN = cs.PeerCertificates[0].Subject.CommonName
+					if len(cs.PeerCertificates[0].DNSNames) > 0 {
+						peerSAN = cs.PeerCertificates[0].DNSNames[0]
+					}
+				}
+				log.Printf("[Upstream] uTLS handshake ok host=%s addr=%s targetSNI=%s alpn=%s echAccepted=%v peerCN=%s peerSAN0=%s", host, addr, targetSNI, cs.NegotiatedProtocol, cs.ECHAccepted, peerCN, peerSAN)
+				if rule.UseCFPool && p.cfPool != nil {
+					h, _, _ := net.SplitHostPort(addr)
+					if h != "" {
+						p.cfPool.ReportSuccess(h)
+					}
+				}
+				return uconn, cs.NegotiatedProtocol, nil
+			}
+			rawConn.Close()
+			errs = append(errs, fmt.Sprintf("%s utls: %v", addr, utlsErr))
+			if rule.UseCFPool && p.cfPool != nil {
+				h, _, _ := net.SplitHostPort(addr)
+				if h != "" {
+					p.cfPool.ReportFailure(h)
+				}
+			}
+			continue
+		}
+
+		// 标准 TLS Fallback（逐候选）
+		upTLSConfig := &tls.Config{
+			ServerName:         sniHost,
+			InsecureSkipVerify: true,
+			NextProtos:         []string{"h2", "http/1.1"},
+		}
+		upstreamTLS := tls.Client(rawConn, upTLSConfig)
+		if err := upstreamTLS.Handshake(); err != nil {
+			rawConn.Close()
+			errs = append(errs, fmt.Sprintf("%s tls: %v", addr, err))
+			if rule.UseCFPool && p.cfPool != nil {
+				h, _, _ := net.SplitHostPort(addr)
+				if h != "" {
+					p.cfPool.ReportFailure(h)
+				}
+			}
+			continue
+		}
+		stdCS := upstreamTLS.ConnectionState()
+		peerCN := ""
+		if len(stdCS.PeerCertificates) > 0 {
+			peerCN = stdCS.PeerCertificates[0].Subject.CommonName
+		}
+		log.Printf("[Upstream] std TLS handshake ok host=%s addr=%s sni=%s alpn=%s peerCN=%s", host, addr, sniHost, stdCS.NegotiatedProtocol, peerCN)
+		if rule.UseCFPool && p.cfPool != nil {
+			h, _, _ := net.SplitHostPort(addr)
+			if h != "" {
+				p.cfPool.ReportSuccess(h)
+			}
+		}
+		return upstreamTLS, stdCS.NegotiatedProtocol, nil
+	}
+
+	if len(errs) == 0 {
+		return nil, "", fmt.Errorf("all candidates failed with unknown error")
+	}
+	return nil, "", fmt.Errorf("all candidates failed: %s", strings.Join(errs, " | "))
 }

@@ -3,6 +3,18 @@
   "type": "transparent",
   "rules": [
     {
+      "name": "dns.google",
+      "enabled": true,
+      "domains": [
+        "dns.google"
+      ],
+      "upstream": "",
+      "sni_fake": "g.cn",
+      "website": "google",
+      "connect_policy": "tunnel_origin",
+      "sni_policy": "none"
+    },
+    {
       "name": "gstatic.com",
       "enabled": true,
       "domains": [
@@ -49,15 +61,19 @@
       "enabled": true,
       "domains": [
         "googlevideo.com",
-        "*.googlevideo.com"
+        "*.googlevideo.com",
+        "c.youtube.com",
+        "*.c.youtube.com"
       ],
-      "upstream": "$1.gvt1.com:443",
-      "sni_fake": "g.cn",
+      "upstream": "",
+      "sni_fake": "www.cloudflare.com",
       "website": "google",
-      "connect_policy": "mitm",
-      "sni_policy": "fake",
+      "connect_policy": "server",
+      "ech_enabled": true,
+      "use_cf_pool": true,
+      "sni_policy": "none",
       "alpn_policy": "h1_only",
-      "utls_policy": "off"
+      "utls_policy": "on"
     },
     {
       "name": "gvt1.com",
@@ -66,13 +82,48 @@
         "gvt1.com",
         "*.gvt1.com"
       ],
-      "upstream": "",
-      "sni_fake": "g.cn",
+      "upstream": "8.137.102.117:443",
+      "sni_fake": "",
       "website": "google",
       "connect_policy": "mitm",
-      "sni_policy": "fake",
+      "sni_policy": "none",
       "alpn_policy": "h1_only",
-      "utls_policy": "off"
+      "utls_policy": "on"
+    },
+    {
+      "id": "sg-chatgpt-server-tp",
+      "name": "chatgpt.com",
+      "website": "openai",
+      "domains": [
+        "chatgpt.com",
+        "*.chatgpt.com",
+        "openai.com",
+        "*.openai.com",
+        "oaistatic.com",
+        "*.oaistatic.com",
+        "oaiusercontent.com",
+        "*.oaiusercontent.com"
+      ],
+      "mode": "server",
+      "upstream": "",
+      "sni_fake": "www.cloudflare.com",
+      "enabled": true,
+      "ech_enabled": true,
+      "use_cf_pool": true,
+      "connect_policy": "server",
+      "sni_policy": "none",
+      "alpn_policy": "h1_only",
+      "utls_policy": "on"
+    },
+    {
+      "name": "store.steampowered.com",
+      "enabled": true,
+      "domains": [
+        "store.steampowered.com"
+      ],
+      "upstream": "184.26.174.116",
+      "sni_fake": "",
+      "website": "steam"
     }
   ]
 }

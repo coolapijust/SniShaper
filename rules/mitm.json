@@ -204,9 +204,10 @@
       "domains": [
         "steamcommunity.com"
       ],
-      "upstream": "steamcommunity.com",
-      "sni_fake": "steamcommunity.com",
-      "website": "steam"
+      "upstream": "23.62.15.194",
+      "sni_fake": "g.cn",
+      "website": "steam",
+      "connect_policy": "transparent"
     },
     {
       "name": "e-hentai.org",
@@ -788,16 +789,6 @@
       "website": "twitch"
     },
     {
-      "name": "store.steampowered.com",
-      "enabled": true,
-      "domains": [
-        "store.steampowered.com"
-      ],
-      "upstream": "23.46.197.62",
-      "sni_fake": "store.steampowered.com",
-      "website": "steam"
-    },
-    {
       "name": "pluto.web.telegram.org",
       "enabled": true,
       "domains": [
@@ -1217,15 +1208,19 @@
       "enabled": true,
       "domains": [
         "googlevideo.com",
-        "*.googlevideo.com"
+        "*.googlevideo.com",
+        "c.youtube.com",
+        "*.c.youtube.com"
       ],
-      "upstream": "$1.gvt1.com:443",
-      "sni_fake": "g.cn",
+      "upstream": "",
+      "sni_fake": "www.cloudflare.com",
       "website": "google",
-      "connect_policy": "mitm",
-      "sni_policy": "fake",
+      "connect_policy": "server",
+      "ech_enabled": true,
+      "use_cf_pool": true,
+      "sni_policy": "none",
       "alpn_policy": "h1_only",
-      "utls_policy": "off"
+      "utls_policy": "on"
     },
     {
       "name": "gvt1.com",
@@ -1234,13 +1229,38 @@
         "gvt1.com",
         "*.gvt1.com"
       ],
-      "upstream": "",
-      "sni_fake": "g.cn",
+      "upstream": "8.137.102.117:443",
+      "sni_fake": "",
       "website": "google",
       "connect_policy": "mitm",
-      "sni_policy": "fake",
+      "sni_policy": "none",
       "alpn_policy": "h1_only",
-      "utls_policy": "off"
+      "utls_policy": "on"
+    },
+    {
+      "id": "sg-chatgpt-server",
+      "name": "chatgpt.com",
+      "website": "openai",
+      "domains": [
+        "chatgpt.com",
+        "*.chatgpt.com",
+        "openai.com",
+        "*.openai.com",
+        "oaistatic.com",
+        "*.oaistatic.com",
+        "oaiusercontent.com",
+        "*.oaiusercontent.com"
+      ],
+      "mode": "server",
+      "upstream": "",
+      "sni_fake": "www.cloudflare.com",
+      "enabled": true,
+      "ech_enabled": true,
+      "use_cf_pool": true,
+      "connect_policy": "server",
+      "sni_policy": "none",
+      "alpn_policy": "h1_only",
+      "utls_policy": "on"
     }
   ]
 }
