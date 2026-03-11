@@ -60,6 +60,7 @@ type RuleManager struct {
 	cloudflareConfig CloudflareConfig
 	serverHost       string
 	serverAuth       string
+	listenPort       string
 	mu               sync.RWMutex
 }
 
@@ -1433,6 +1434,10 @@ func (rm *RuleManager) LoadConfig() error {
 	rm.cloudflareConfig = config.CloudflareConfig
 	rm.serverHost = config.ServerHost
 	rm.serverAuth = config.ServerAuth
+	rm.listenPort = config.ListenPort
+	if rm.listenPort == "" {
+		rm.listenPort = "8080"
+	}
 
 	// Sync Cloudflare Config if ProxyServer is linked
 	// Note: In current architecture, RuleManager doesn't have a back-pointer to ProxyServer.
@@ -1618,6 +1623,41 @@ func (rm *RuleManager) GetServerAuth() string {
 	return rm.serverAuth
 }
 
+func (rm *RuleManager) GetListenPort() string {
+	rm.mu.RLock()
+	defer rm.mu.RUnlock()
+	return rm.listenPort
+}
+
+func (rm *RuleManager) SetListenPort(port string) {
+	rm.mu.Lock()
+	rm.listenPort = port
+	rm.mu.Unlock()
+}
+
+func (rm *RuleManager) SaveConfig() error {
+	rm.mu.RLock()
+	defer rm.mu.RUnlock()
+	if rm.listenPort == "" {
+		rm.listenPort = "8080"
+	}
+	config := Config{
+		ListenPort:       rm.listenPort,
+		ServerHost:       rm.serverHost,
+		ServerAuth:       rm.serverAuth,
+		SiteGroups:       rm.siteGroups,
+		Upstreams:        rm.upstreams,
+		CloudflareConfig: rm.cloudflareConfig,
+	}
+
+	data, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(rm.configPath, data, 0644)
+}
+
 func (rm *RuleManager) UpdateServerConfig(host, auth string) error {
 	rm.mu.Lock()
 	rm.serverHost = host
@@ -1721,8 +1761,11 @@ func (rm *RuleManager) DeleteUpstream(id string) error {
 }
 
 func (rm *RuleManager) saveConfig() error {
+	if rm.listenPort == "" {
+		rm.listenPort = "8080"
+	}
 	config := Config{
-		ListenPort:       "8080",
+		ListenPort:       rm.listenPort,
 		ServerHost:       rm.serverHost,
 		ServerAuth:       rm.serverAuth,
 		SiteGroups:       rm.siteGroups,

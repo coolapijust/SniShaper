@@ -115,9 +115,19 @@ func NewApp() *App {
 	execDir := filepath.Dir(execPath)
 	configPath := filepath.Join(execDir, "config.json")
 
+	ruleManager := proxy.NewRuleManager(configPath)
+	if err := ruleManager.LoadConfig(); err != nil {
+		log.Printf("[warn] Failed to load config at init: %v", err)
+	}
+
+	port := ruleManager.GetListenPort()
+	if port == "" {
+		port = "8080"
+	}
+
 	return &App{
-		proxyServer: proxy.NewProxyServer("127.0.0.1:8080"),
-		ruleManager: proxy.NewRuleManager(configPath),
+		proxyServer: proxy.NewProxyServer("127.0.0.1:" + port),
+		ruleManager: ruleManager,
 		certPath:    filepath.Join(execDir, "cert"),
 		logPath:     filepath.Join(execDir, "snishaper.log"),
 	}
@@ -303,7 +313,12 @@ func (a *App) SetListenPort(port int) error {
 		return fmt.Errorf("invalid port number: %d", port)
 	}
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	return a.proxyServer.SetListenAddr(addr)
+	err := a.proxyServer.SetListenAddr(addr)
+	if err != nil {
+		return err
+	}
+	a.ruleManager.SetListenPort(fmt.Sprintf("%d", port))
+	return a.ruleManager.SaveConfig()
 }
 
 func (a *App) SetProxyMode(mode string) error {

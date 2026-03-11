@@ -257,11 +257,10 @@ exhentai.org" rows="3"></textarea>
                     <h3>代理设置</h3>
                     <div class="setting-item">
                         <label>监听端口</label>
-                        <input type="text" id="setting-port" value="8080">
-                    </div>
-                    <div class="setting-item">
-                        <label>启用日志</label>
-                        <input type="checkbox" id="setting-logs" checked>
+                        <div style="display: flex; gap: 8px; align-items: center;">
+                            <input type="text" id="setting-port" value="8080" style="width: 80px;">
+                            <button class="btn btn-primary" onclick="applyPort()">应用</button>
+                        </div>
                     </div>
                 </div>
 

@@ -61,20 +61,19 @@ SniShaper 支持两种服务端部署方式：
 ### 方式一：Cloudflare Worker (无成本)
 
 ```text
-客户端 → Worker (免费/Serverless) → 目标网站
+客户端 → Worker → 目标网站
 ```
 
 **部署步骤：**
 
 1. 登录 [Cloudflare Dashboard](https://dash.cloudflare.com/)
-2. 创建一个新的 Worker 服务
+2. 创建一个新的 Worker hello world模板
 3. 将 `sni-server/worker.js` 的内容复制到 Worker 编辑器
-4. 在 Worker 设置中添加环境变量 `AUTH_SECRET`，设置你的鉴权密码
-5. 部署 Worker，获取 Worker 域名（如 `proxy.xxx.workers.dev`）
-6. 在客户端配置中：
-   - 模式选择 `server`
-   - 服务器地址填写 `https://proxy.xxx.workers.dev`
-   - 鉴权 Token 填写上一步设置的密码
+4. 在 Worker 设置中添加环境变量 `AUTH_SECRET`，设置密码
+5. 部署 Worker，获取 Worker 域名（如 `xxx.workers.dev`）
+6. 在客户端server节点设置中：
+   - 中转域名填写 `xxx.workers.dev`
+   - 鉴权密钥填写上一步设置的密码
 
 **请求格式：**
 ```
@@ -90,26 +89,12 @@ https://proxy.xxx.workers.dev/{AUTH_SECRET}/{目标域名}/{路径}
 **部署步骤：**
 
 1. 准备一台 VPS（任何支持 Go 的 Linux 服务器）
-2. 下载/编译 sni-server：
+2.运行一键部署脚本：
+curl -fsSL https://raw.githubusercontent.com/coolapijust/Shaper-Next/main/server/install.sh -o /tmp/sni-server-install.sh && sudo bash /tmp/sni-server-install.sh
 
-```bash
-cd sni-server
-go build -o sni-server .
-```
+3. 配置域名解析。推荐使用Cloudflare tunnel：一键脚本可使用 bash <(curl -sSL https://github.com/sky22333/shell/raw/main/dev/cf-tunnel.sh) 绑定软件运行的端口（来源 https://linux.do/t/topic/694177/14）
 
-3. 运行一键部署脚本：
-
-```bash
-sudo bash install.sh
-```
-
-或手动运行：
-
-```bash
-./sni-server -port 443 -secret YOUR_AUTH_SECRET
-```
-
-4. 配置域名解析（使用 Cloudflare Tunnel 或手动绑定域名）
+）
 5. 在客户端配置中填写 VPS 地址和鉴权 Token
 
 **请求格式：**
@@ -117,20 +102,12 @@ sudo bash install.sh
 https://your-domain.com/{AUTH_SECRET}/{目标域名}/{路径}
 ```
 
-### 对比
 
-| 特性 | Worker | VPS (sni-server) |
-|------|--------|------------------|
-| 成本 | 免费 | 需要 VPS |
-| 维护 | 无需 | 需要管理 |
-| 出口IP | Cloudflare IP | VPS IP |
-| 带宽限制 | 有 | 取决于 VPS |
-| 定制化 | 有限 | 完全控制 |
 
 ## 常见问题
 
 - **证书错误**：请确认证书已导入“受信任的根证书”分类，并务必重启浏览器。
-- **访问速度慢**：建议在“优选 IP 池”中添加更多当前环境下延迟较低的边缘节点 IP。
+- **访问速度慢**：建议在“优选 IP 池”中添加更多当前环境下延迟较低的Cloudflare anycast IP。
 
 ## 致谢
 

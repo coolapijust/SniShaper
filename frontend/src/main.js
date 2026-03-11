@@ -1241,34 +1241,26 @@ document.addEventListener('DOMContentLoaded', async () => {
         } catch (err) {
             console.error('Get listen port error:', err);
         }
-        portInput.addEventListener('change', async () => {
-            const newPort = parseInt(portInput.value, 10);
-            if (newPort >= 1 && newPort <= 65535) {
-                try {
-                    await SetListenPort(newPort);
-                    document.getElementById('listen-port').textContent = newPort;
-                    addLog('info', '监听端口已设置为 ' + newPort);
-                } catch (err) {
-                    addLog('error', '设置端口失败: ' + err);
-                    portInput.value = await GetListenPort();
-                }
-            } else {
-                addLog('error', '端口号无效 (1-65535)');
-                portInput.value = await GetListenPort();
-            }
-        });
     }
 
-    const logsCheckbox = document.getElementById('setting-logs');
-    if (logsCheckbox) {
-        logsCheckbox.checked = loggingEnabled;
-        logsCheckbox.addEventListener('change', () => {
-            loggingEnabled = logsCheckbox.checked;
-            if (loggingEnabled) {
-                addLog('info', '日志已启用');
+    window.applyPort = async function() {
+        const portInput = document.getElementById('setting-port');
+        if (!portInput) return;
+        
+        const newPort = parseInt(portInput.value, 10);
+        if (newPort >= 1 && newPort <= 65535) {
+            try {
+                await SetListenPort(newPort);
+                document.getElementById('listen-port').textContent = newPort;
+                addLog('info', '监听端口已设置为 ' + newPort);
+            } catch (err) {
+                addLog('error', '设置端口失败: ' + err);
+                portInput.value = await GetListenPort();
             }
-        });
-    }
+        } else {
+            addLog('error', '端口号无效 (1-65535)');
+        }
+    };
 
     addLog('info', 'SniShaper 已就绪');
 
